@@ -11,7 +11,9 @@ Research-grade machine learning system for ICU time-series modeling, targeting I
 
 ## Dataset
 
-Download `eicu_final_sequences_for_modeling.csv` and place it at:
+Download `eicu_final_sequences_for_modeling.csv` from
+[Google Drive](https://drive.google.com/file/d/1cjf5yjnQXpuMLJSyQlhQkn75g7Pi9GUK/view?usp=sharing)
+and place it at:
 
 ```
 data/eicu_final_sequences_for_modeling.csv
