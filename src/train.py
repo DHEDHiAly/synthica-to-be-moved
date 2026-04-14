@@ -21,6 +21,7 @@ Training procedure
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import math
 import os
@@ -29,6 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -62,6 +64,7 @@ from eval import (
     evaluate_counterfactual,
     monitor_disentanglement,
     generate_report,
+    compute_st_probe_auroc,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,6 +135,19 @@ DEFAULT_CFG: Dict[str, Any] = {
     "checkpoint_dir": "outputs/checkpoints",
     "log_file": "outputs/train.log",
     "results_path": "outputs/results.json",
+}
+
+# ---------------------------------------------------------------------------
+# Paper-ready ablation name mapping
+# ---------------------------------------------------------------------------
+
+ABLATION_PAPER_NAMES: Dict[str, str] = {
+    "no_adversaries": "w/o Adversarial",
+    "no_contrastive": "w/o Contrastive",
+    "minimal_e":      "w/o e_t",
+    "no_invariant_s": "e_t only",
+    "no_hosp_adv":    "w/o Hosp Adv",
+    "no_trt_adv":     "w/o Trt Adv",
 }
 
 
@@ -849,8 +865,42 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
     logger.info("=" * 60)
 
     # ------------------------------------------------------------------
+    # Generate plots and tables
+    # ------------------------------------------------------------------
+    try:
+        generate_plots(report, main_model, trained_baselines, ablation_results,
+                       test_loader, device, cfg["output_dir"])
+        logger.info("Plots saved to %s/plots/", cfg["output_dir"])
+    except Exception as exc:
+        logger.warning("Plot generation failed: %s", exc)
+
+    try:
+        generate_tables(report, ablation_results, cfg["output_dir"])
+        logger.info("Tables saved to %s/tables/", cfg["output_dir"])
+    except Exception as exc:
+        logger.warning("Table generation failed: %s", exc)
+
+    try:
+        generate_metrics_csv(report, ablation_results, cfg["output_dir"])
+        logger.info("metrics.csv saved to %s/", cfg["output_dir"])
+    except Exception as exc:
+        logger.warning("metrics.csv generation failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Human-readable summary
     # ------------------------------------------------------------------
+    _print_final_summary(report, indist, ooh_result, ablation_results,
+                         baseline_best_hparams)
+
+
+def _print_final_summary(
+    report: Dict[str, Any],
+    indist: Dict[str, Any],
+    ooh_result: Optional[Dict[str, Any]],
+    ablation_results: Dict[str, Any],
+    baseline_best_hparams: Dict[str, Any],
+) -> None:
+    """Print a concise final summary matching the required format."""
     print("\n" + "=" * 60)
     print("RESULTS SUMMARY")
     print("=" * 60)
@@ -861,31 +911,39 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
         f"  AUROC={m.get('auroc', float('nan')):.4f}"
         f"  AUPRC={m.get('auprc', float('nan')):.4f}"
         f"  ACC={m.get('accuracy', float('nan')):.4f}"
-        f"  ECE={m.get('ece', float('nan')):.4f}"   # required calibration metric
+        f"  ECE={m.get('ece', float('nan')):.4f}"
     )
     if ooh_result:
         ooh_m = ooh_result.get("out_of_hospital", {})
+        in_m = ooh_result.get("in_dist", {})
+        gap = ooh_result.get("domain_shift", {}).get("auroc_drop", float("nan"))
         print(
             f"Main model (out-of-hospital):"
-            f"  AUROC={ooh_m.get('auroc', float('nan')):.4f}"
+            f"  In-Dist AUROC={in_m.get('auroc', float('nan')):.4f}"
+            f"  OOD AUROC={ooh_m.get('auroc', float('nan')):.4f}"
+            f"  Generalization Gap={gap:.4f}"
             f"  ECE={ooh_m.get('ece', float('nan')):.4f}"
-            f"  ΔAUROC_drop={ooh_result.get('domain_shift', {}).get('auroc_drop', float('nan')):.4f}"
         )
 
     # ΔAUROC vs best baseline
     auroc_cmp = report.get("auroc_comparison", {})
     if auroc_cmp:
-        if auroc_cmp.get("main_model_competitive"):
-            competitive = "[PASS]"
-        else:
-            competitive = "[WARN] BELOW BASELINE"
+        status = auroc_cmp.get("competitive_status", "N/A")
+        delta = auroc_cmp.get("delta_auroc", float("nan"))
+        sign = "+" if (delta == delta and delta >= 0) else ""
         print(
-            f"\nAUROC competitiveness {competitive}:"
+            f"\nAUROC competitiveness [{status}]:"
             f"  main={auroc_cmp.get('main_model_auroc', float('nan')):.4f}"
             f"  best_baseline={auroc_cmp.get('best_baseline_name')} "
             f"({auroc_cmp.get('best_baseline_auroc', float('nan')):.4f})"
-            f"  DELTA_AUROC={sign}{auroc_cmp.get('delta_auroc', float('nan')):.4f}"
+            f"  ΔAUROC={sign}{delta:.4f}"
         )
+
+    # s_t probe AUROC
+    st_probe = report.get("st_probe_auroc", float("nan"))
+    _ST_PROBE_THRESHOLD = 0.60
+    st_status = "VALID" if (st_probe == st_probe and st_probe >= _ST_PROBE_THRESHOLD) else "LOW"
+    print(f"\ns_t Probe AUROC: {st_probe:.4f} → {st_status}")
 
     print(f"\nBaselines:")
     for bname, bm in report.get("baselines", {}).items():
@@ -901,9 +959,10 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
     if ablation_results:
         print(f"\nAblations:")
         for aname, am in ablation_results.items():
+            paper_name = ABLATION_PAPER_NAMES.get(aname, aname)
             flag = "← KEY: tests if s_t carries signal" if aname == "no_invariant_s" else ""
             print(
-                f"  {aname:25s}: AUROC={am.get('auroc', float('nan')):.4f}"
+                f"  {paper_name:25s}: AUROC={am.get('auroc', float('nan')):.4f}"
                 f"  ECE={am.get('ece', float('nan')):.4f}  {flag}"
             )
 
@@ -913,9 +972,562 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
         print(
             f"\nDisentanglement monitor: s_var={disent.get('s_var_mean', float('nan')):.4e}"
             f"  recon_degradation={disent.get('recon_degradation_frac', float('nan')):.2%}"
-            f"  [{collapse}]"
+            f"  {collapse}"
         )
 
+    print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Plot generation (matplotlib only)
+# ---------------------------------------------------------------------------
+
+def generate_plots(
+    report: Dict[str, Any],
+    main_model: nn.Module,
+    trained_baselines: Dict[str, nn.Module],
+    ablation_results: Dict[str, Any],
+    test_loader,
+    device: torch.device,
+    output_dir: str = "outputs",
+) -> None:
+    """Generate all required plots using matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import precision_recall_curve, roc_curve
+    from sklearn.calibration import calibration_curve as sklearn_cal_curve
+
+    plots_dir = Path(output_dir) / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect main model probs/labels
+    main_probs = np.array(report.get("_main_model_probs", []))
+    main_labels = np.array(report.get("_main_model_labels", []))
+
+    # Identify best baseline
+    auroc_cmp = report.get("auroc_comparison", {})
+    best_bl_name = auroc_cmp.get("best_baseline_name", "")
+    best_bl_probs = np.array(report.get("_baseline_probs", {}).get(best_bl_name, []))
+
+    # ------------------------------------------------------------------
+    # 1. AUROC Comparison bar chart
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(10, 6))
+    names, aurocs, colors = [], [], []
+    for bname, bm in report.get("baselines", {}).items():
+        if "_ooh" in bname:
+            continue
+        names.append(bname)
+        aurocs.append(bm.get("auroc", float("nan")))
+        colors.append("#f4a261" if bname == best_bl_name else "#adb5bd")
+    # Add main model
+    main_auroc = report.get("main_model_indist", {}).get("auroc", float("nan"))
+    names.append("DisentangledICU\n(Main)")
+    aurocs.append(main_auroc)
+    colors.append("#2a9d8f")
+
+    bars = ax.barh(names, aurocs, color=colors)
+    ax.set_xlabel("AUROC")
+    ax.set_title("AUROC Comparison: Baselines vs Main Model")
+    ax.axvline(x=0.5, color="gray", linestyle="--", linewidth=0.8, label="Random")
+    for bar, val in zip(bars, aurocs):
+        if val == val:  # not nan
+            ax.text(bar.get_width() + 0.002, bar.get_y() + bar.get_height() / 2,
+                    f"{val:.3f}", va="center", fontsize=8)
+    ax.set_xlim(0.4, 1.05)
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#2a9d8f", label="Main Model"),
+        Patch(facecolor="#f4a261", label="Best Baseline"),
+        Patch(facecolor="#adb5bd", label="Other Baselines"),
+    ]
+    ax.legend(handles=legend_elements, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(str(plots_dir / "auroc_comparison.png"), dpi=120)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # 2. Precision-Recall Curve
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(7, 6))
+    if len(main_probs) > 0 and len(np.unique(main_labels)) > 1:
+        prec, rec, _ = precision_recall_curve(main_labels, main_probs)
+        main_auprc = report.get("main_model_indist", {}).get("auprc", float("nan"))
+        ax.plot(rec, prec, color="#2a9d8f", lw=2,
+                label=f"Main Model (AUPRC={main_auprc:.3f})")
+    if len(best_bl_probs) > 0 and len(np.unique(main_labels)) > 1:
+        try:
+            prec_bl, rec_bl, _ = precision_recall_curve(main_labels, best_bl_probs)
+            bl_auprc = report.get("baselines", {}).get(best_bl_name, {}).get("auprc", float("nan"))
+            ax.plot(rec_bl, prec_bl, color="#f4a261", lw=2, linestyle="--",
+                    label=f"{best_bl_name} (AUPRC={bl_auprc:.3f})")
+        except Exception:
+            pass
+    # Baseline random
+    pos_rate = main_labels.mean() if len(main_labels) > 0 else 0.5
+    ax.axhline(y=pos_rate, color="gray", linestyle=":", lw=1, label=f"Random (={pos_rate:.2f})")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Precision-Recall Curve")
+    ax.legend()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.05)
+    fig.tight_layout()
+    fig.savefig(str(plots_dir / "pr_curve.png"), dpi=120)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # 3. Calibration Curve
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.plot([0, 1], [0, 1], "k--", label="Perfect calibration")
+    if len(main_probs) > 0 and len(np.unique(main_labels)) > 1:
+        try:
+            frac_pos, mean_pred = sklearn_cal_curve(main_labels, main_probs, n_bins=10)
+            main_ece = report.get("main_model_indist", {}).get("ece", float("nan"))
+            ax.plot(mean_pred, frac_pos, "s-", color="#2a9d8f", lw=2,
+                    label=f"Main Model (ECE={main_ece:.3f})")
+        except Exception:
+            pass
+    if len(best_bl_probs) > 0 and len(np.unique(main_labels)) > 1:
+        try:
+            frac_pos_bl, mean_pred_bl = sklearn_cal_curve(main_labels, best_bl_probs, n_bins=10)
+            bl_ece = report.get("baselines", {}).get(best_bl_name, {}).get("ece", float("nan"))
+            ax.plot(mean_pred_bl, frac_pos_bl, "o--", color="#f4a261", lw=2,
+                    label=f"{best_bl_name} (ECE={bl_ece:.3f})")
+        except Exception:
+            pass
+    ax.set_xlabel("Mean Predicted Probability")
+    ax.set_ylabel("Fraction of Positives")
+    ax.set_title("Calibration Curve")
+    ax.legend()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.05)
+    fig.tight_layout()
+    fig.savefig(str(plots_dir / "calibration_curve.png"), dpi=120)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # 4. Domain Generalization Plot
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(9, 5))
+    model_names_dg, indist_aurocs, ood_aurocs, gaps = [], [], [], []
+
+    main_ooh = report.get("main_model_ooh", {})
+    if main_ooh:
+        in_a = main_ooh.get("in_dist", {}).get("auroc", float("nan"))
+        ood_a = main_ooh.get("out_of_hospital", {}).get("auroc", float("nan"))
+        model_names_dg.append("Main Model")
+        indist_aurocs.append(in_a)
+        ood_aurocs.append(ood_a)
+        gaps.append(in_a - ood_a if (in_a == in_a and ood_a == ood_a) else float("nan"))
+
+    for bname, bdata in report.get("baselines", {}).items():
+        if "_ooh" not in bname:
+            continue
+        bl_base = bname.replace("_ooh", "")
+        in_a = bdata.get("in_dist", {}).get("auroc", float("nan"))
+        ood_a = bdata.get("out_of_hospital", {}).get("auroc", float("nan"))
+        model_names_dg.append(bl_base)
+        indist_aurocs.append(in_a)
+        ood_aurocs.append(ood_a)
+        gaps.append(in_a - ood_a if (in_a == in_a and ood_a == ood_a) else float("nan"))
+
+    if model_names_dg:
+        x = np.arange(len(model_names_dg))
+        width = 0.35
+        bars_in = ax.bar(x - width / 2, indist_aurocs, width, label="In-Dist", color="#2a9d8f")
+        bars_ood = ax.bar(x + width / 2, ood_aurocs, width, label="OOD", color="#e76f51")
+        ax.set_xticks(x)
+        ax.set_xticklabels(model_names_dg, rotation=30, ha="right")
+        ax.set_ylabel("AUROC")
+        ax.set_title("Domain Generalization: In-Distribution vs Out-of-Hospital")
+        ax.set_ylim(0.3, 1.05)
+        ax.legend()
+        # Annotate gaps
+        for i, g in enumerate(gaps):
+            if g == g:  # not nan
+                ax.annotate(f"Gap={g:.3f}", xy=(i, max(indist_aurocs[i], ood_aurocs[i]) + 0.01),
+                            ha="center", fontsize=7, color="darkred")
+        fig.tight_layout()
+    else:
+        ax.text(0.5, 0.5, "No OOH evaluation data available",
+                ha="center", va="center", transform=ax.transAxes)
+    fig.savefig(str(plots_dir / "domain_generalization.png"), dpi=120)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # 5. Ablation Study Plot
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 5))
+    main_auroc_val = report.get("main_model_indist", {}).get("auroc", float("nan"))
+    abl_names_plot = ["Full Model"]
+    abl_aurocs_plot = [main_auroc_val]
+    abl_colors_plot = ["#2a9d8f"]
+
+    for abl_key, abl_m in ablation_results.items():
+        paper_name = ABLATION_PAPER_NAMES.get(abl_key, abl_key)
+        abl_names_plot.append(paper_name)
+        abl_aurocs_plot.append(abl_m.get("auroc", float("nan")))
+        abl_colors_plot.append("#e9c46a" if abl_key == "no_invariant_s" else "#adb5bd")
+
+    bars = ax.barh(abl_names_plot, abl_aurocs_plot, color=abl_colors_plot)
+    ax.set_xlabel("AUROC")
+    ax.set_title("Ablation Study")
+    if main_auroc_val == main_auroc_val:
+        ax.axvline(x=main_auroc_val, color="#2a9d8f", linestyle="--", lw=1.5,
+                   label=f"Full Model ({main_auroc_val:.3f})")
+    for bar, val in zip(bars, abl_aurocs_plot):
+        if val == val:
+            ax.text(bar.get_width() + 0.002, bar.get_y() + bar.get_height() / 2,
+                    f"{val:.3f}", va="center", fontsize=8)
+    ax.set_xlim(0.3, 1.05)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(str(plots_dir / "ablation_study.png"), dpi=120)
+    plt.close(fig)
+
+    logger.info("Plots saved: %s", [str(p) for p in plots_dir.glob("*.png")])
+
+
+# ---------------------------------------------------------------------------
+# Table generation (paper-ready CSV tables)
+# ---------------------------------------------------------------------------
+
+def generate_tables(
+    report: Dict[str, Any],
+    ablation_results: Dict[str, Any],
+    output_dir: str = "outputs",
+) -> None:
+    """Generate paper-ready CSV tables."""
+    tables_dir = Path(output_dir) / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+
+    auroc_cmp = report.get("auroc_comparison", {})
+    main_m = report.get("main_model_indist", {})
+    main_ooh = report.get("main_model_ooh", {})
+
+    def _fmt(v: Any, fmt: str = ".4f") -> str:
+        try:
+            return format(float(v), fmt)
+        except (TypeError, ValueError):
+            return "N/A"
+
+    # ------------------------------------------------------------------
+    # 1. Main Results Table
+    # ------------------------------------------------------------------
+    main_in_auroc = _fmt(main_m.get("auroc"))
+    main_ooh_auroc = _fmt(main_ooh.get("out_of_hospital", {}).get("auroc") if main_ooh else None)
+    main_gap = _fmt(main_ooh.get("domain_shift", {}).get("auroc_drop") if main_ooh else None)
+    delta_auroc = auroc_cmp.get("delta_auroc", float("nan"))
+    delta_sign = "+" if (delta_auroc == delta_auroc and delta_auroc >= 0) else ""
+
+    with open(str(tables_dir / "main_results_table.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Model", "AUROC", "AUPRC", "ECE", "In-Dist AUROC",
+                         "OOD AUROC", "Gen Gap", "ΔAUROC vs Best Baseline",
+                         "Competitive Status", "s_t Probe AUROC"])
+        st_probe = report.get("st_probe_auroc", float("nan"))
+        writer.writerow([
+            "DisentangledICU (Main)",
+            main_in_auroc,
+            _fmt(main_m.get("auprc")),
+            _fmt(main_m.get("ece")),
+            main_in_auroc,
+            main_ooh_auroc,
+            main_gap,
+            f"{delta_sign}{_fmt(delta_auroc)}",
+            auroc_cmp.get("competitive_status", "N/A"),
+            _fmt(st_probe),
+        ])
+        writer.writerow([])
+        writer.writerow([f"Best Baseline: {auroc_cmp.get('best_baseline_name', 'N/A')}",
+                         _fmt(auroc_cmp.get("best_baseline_auroc"))])
+
+    # ------------------------------------------------------------------
+    # 2. Baseline Table
+    # ------------------------------------------------------------------
+    with open(str(tables_dir / "baseline_table.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Model", "AUROC", "AUPRC", "Accuracy", "ECE", "OOD AUROC", "Gen Gap"])
+        for bname, bm in report.get("baselines", {}).items():
+            if "_ooh" in bname:
+                continue
+            ooh_key = f"{bname}_ooh"
+            bl_ooh = report.get("baselines", {}).get(ooh_key, {})
+            ood_auroc = _fmt(bl_ooh.get("out_of_hospital", {}).get("auroc") if bl_ooh else None)
+            gen_gap = _fmt(bl_ooh.get("domain_shift", {}).get("auroc_drop") if bl_ooh else None)
+            best_marker = " *" if bname == auroc_cmp.get("best_baseline_name") else ""
+            writer.writerow([
+                f"{bname}{best_marker}",
+                _fmt(bm.get("auroc")),
+                _fmt(bm.get("auprc")),
+                _fmt(bm.get("accuracy")),
+                _fmt(bm.get("ece")),
+                ood_auroc,
+                gen_gap,
+            ])
+        writer.writerow([])
+        writer.writerow(["* = best baseline"])
+
+    # ------------------------------------------------------------------
+    # 3. Ablation Table
+    # ------------------------------------------------------------------
+    with open(str(tables_dir / "ablation_table.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Model", "AUROC", "AUPRC", "Accuracy", "ECE"])
+        # Full model first
+        writer.writerow([
+            "Full Model",
+            _fmt(main_m.get("auroc")),
+            _fmt(main_m.get("auprc")),
+            _fmt(main_m.get("accuracy")),
+            _fmt(main_m.get("ece")),
+        ])
+        # Ablations with paper names
+        abl_order = ["no_adversaries", "no_contrastive", "minimal_e", "no_invariant_s",
+                     "no_hosp_adv", "no_trt_adv"]
+        for abl_key in abl_order:
+            abl_m = ablation_results.get(abl_key)
+            if abl_m is None:
+                continue
+            paper_name = ABLATION_PAPER_NAMES.get(abl_key, abl_key)
+            writer.writerow([
+                paper_name,
+                _fmt(abl_m.get("auroc")),
+                _fmt(abl_m.get("auprc")),
+                _fmt(abl_m.get("accuracy")),
+                _fmt(abl_m.get("ece")),
+            ])
+        # Any remaining ablations not in the standard order
+        for abl_key, abl_m in ablation_results.items():
+            if abl_key not in abl_order:
+                paper_name = ABLATION_PAPER_NAMES.get(abl_key, abl_key)
+                writer.writerow([
+                    paper_name,
+                    _fmt(abl_m.get("auroc")),
+                    _fmt(abl_m.get("auprc")),
+                    _fmt(abl_m.get("accuracy")),
+                    _fmt(abl_m.get("ece")),
+                ])
+
+    logger.info("Tables saved to %s", tables_dir)
+
+
+# ---------------------------------------------------------------------------
+# Metrics CSV generation
+# ---------------------------------------------------------------------------
+
+def generate_metrics_csv(
+    report: Dict[str, Any],
+    ablation_results: Dict[str, Any],
+    output_dir: str = "outputs",
+) -> None:
+    """Save all metrics in a flat metrics.csv file."""
+    out_path = Path(output_dir) / "metrics.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    main_m = report.get("main_model_indist", {})
+    main_ooh = report.get("main_model_ooh", {})
+    auroc_cmp = report.get("auroc_comparison", {})
+    st_probe = report.get("st_probe_auroc", float("nan"))
+
+    in_dist_auroc = main_m.get("auroc", float("nan"))
+    ood_auroc = (main_ooh.get("out_of_hospital", {}).get("auroc", float("nan"))
+                 if main_ooh else float("nan"))
+    gen_gap = (main_ooh.get("domain_shift", {}).get("auroc_drop", float("nan"))
+               if main_ooh else float("nan"))
+    delta_auroc = auroc_cmp.get("delta_auroc", float("nan"))
+
+    rows.append({
+        "model": "main_model",
+        "auroc": in_dist_auroc,
+        "auprc": main_m.get("auprc", float("nan")),
+        "accuracy": main_m.get("accuracy", float("nan")),
+        "ece": main_m.get("ece", float("nan")),
+        "in_dist_auroc": in_dist_auroc,
+        "ood_auroc": ood_auroc,
+        "generalization_gap": gen_gap,
+        "delta_auroc_vs_best_baseline": delta_auroc,
+        "competitive_status": auroc_cmp.get("competitive_status", "N/A"),
+        "st_probe_auroc": st_probe,
+    })
+
+    for bname, bm in report.get("baselines", {}).items():
+        if "_ooh" in bname:
+            continue
+        bl_ooh = report.get("baselines", {}).get(f"{bname}_ooh", {})
+        b_ood = (bl_ooh.get("out_of_hospital", {}).get("auroc", float("nan"))
+                 if bl_ooh else float("nan"))
+        b_gap = (bl_ooh.get("domain_shift", {}).get("auroc_drop", float("nan"))
+                 if bl_ooh else float("nan"))
+        rows.append({
+            "model": bname,
+            "auroc": bm.get("auroc", float("nan")),
+            "auprc": bm.get("auprc", float("nan")),
+            "accuracy": bm.get("accuracy", float("nan")),
+            "ece": bm.get("ece", float("nan")),
+            "in_dist_auroc": bm.get("auroc", float("nan")),
+            "ood_auroc": b_ood,
+            "generalization_gap": b_gap,
+            "delta_auroc_vs_best_baseline": float("nan"),
+            "competitive_status": "N/A",
+            "st_probe_auroc": float("nan"),
+        })
+
+    for abl_key, abl_m in ablation_results.items():
+        paper_name = ABLATION_PAPER_NAMES.get(abl_key, abl_key)
+        rows.append({
+            "model": f"ablation_{abl_key}",
+            "auroc": abl_m.get("auroc", float("nan")),
+            "auprc": abl_m.get("auprc", float("nan")),
+            "accuracy": abl_m.get("accuracy", float("nan")),
+            "ece": abl_m.get("ece", float("nan")),
+            "in_dist_auroc": abl_m.get("auroc", float("nan")),
+            "ood_auroc": float("nan"),
+            "generalization_gap": float("nan"),
+            "delta_auroc_vs_best_baseline": float("nan"),
+            "competitive_status": "N/A",
+            "st_probe_auroc": float("nan"),
+        })
+
+    fieldnames = ["model", "auroc", "auprc", "accuracy", "ece",
+                  "in_dist_auroc", "ood_auroc", "generalization_gap",
+                  "delta_auroc_vs_best_baseline", "competitive_status", "st_probe_auroc"]
+    with open(str(out_path), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info("Metrics CSV saved to %s", out_path)
+
+
+# ---------------------------------------------------------------------------
+# Full experiment: multi-seed run
+# ---------------------------------------------------------------------------
+
+def run_full_experiment(cfg: Dict[str, Any]) -> None:
+    """
+    Run the full experiment pipeline with multi-seed evaluation.
+
+    Procedure:
+    1. Run the complete pipeline (baselines + main model + ablations) with seed=42.
+    2. Run the main model only with seeds 43 and 44 for stability assessment.
+    3. Report mean ± std of main model AUROC across seeds.
+    4. Generate all output files (plots, tables, metrics.csv).
+    """
+    seeds = [42, 43, 44]
+
+    logger.info("=" * 60)
+    logger.info("FULL EXPERIMENT: multi-seed evaluation (seeds=%s)", seeds)
+    logger.info("=" * 60)
+
+    # ------------------------------------------------------------------
+    # Seed 42 — full pipeline (baselines + main + ablations)
+    # ------------------------------------------------------------------
+    seed42_cfg = {**cfg, "seed": seeds[0]}
+    logger.info("--- Seed %d: full pipeline ---", seeds[0])
+    main(seed42_cfg)
+
+    # ------------------------------------------------------------------
+    # Seeds 43, 44 — main model only (no baselines, no ablations)
+    # ------------------------------------------------------------------
+    seed_aurocs: List[float] = []
+
+    # Load seed-42 result to get seed-42 AUROC
+    import json
+    results_path = cfg.get("results_path", "outputs/results.json")
+    try:
+        with open(results_path) as f:
+            seed42_report = json.load(f)
+        seed42_auroc = seed42_report.get("main_model_indist", {}).get("auroc", float("nan"))
+        seed_aurocs.append(seed42_auroc)
+        logger.info("Seed %d main model AUROC = %.4f", seeds[0], seed42_auroc)
+    except Exception as exc:
+        logger.warning("Could not load seed-42 results: %s", exc)
+        seed42_auroc = float("nan")
+
+    for seed in seeds[1:]:
+        logger.info("--- Seed %d: main model only ---", seed)
+        seed_cfg = {
+            **cfg,
+            "seed": seed,
+            "run_baselines": False,
+            "run_ablations": False,
+            "results_path": f"{cfg['output_dir']}/results_seed{seed}.json",
+            "checkpoint_dir": f"{cfg['checkpoint_dir']}/seed{seed}",
+            "log_file": f"{cfg['output_dir']}/train_seed{seed}.log",
+        }
+        Path(seed_cfg["checkpoint_dir"]).mkdir(parents=True, exist_ok=True)
+        try:
+            main(seed_cfg)
+            with open(seed_cfg["results_path"]) as f:
+                seed_report = json.load(f)
+            s_auroc = seed_report.get("main_model_indist", {}).get("auroc", float("nan"))
+            seed_aurocs.append(s_auroc)
+            logger.info("Seed %d main model AUROC = %.4f", seed, s_auroc)
+        except Exception as exc:
+            logger.error("Seed %d run failed: %s", seed, exc, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Multi-seed summary
+    # ------------------------------------------------------------------
+    valid_aurocs = [a for a in seed_aurocs if a == a]  # filter nan
+    if valid_aurocs:
+        mean_auroc = float(np.mean(valid_aurocs))
+        std_auroc = float(np.std(valid_aurocs))
+        logger.info(
+            "Multi-seed AUROC: %.4f ± %.4f  (seeds=%s, n=%d)",
+            mean_auroc, std_auroc, seeds[:len(valid_aurocs)], len(valid_aurocs),
+        )
+        high_variance = std_auroc > 0.02
+        if high_variance:
+            logger.warning(
+                "[WARN] High variance across seeds: std=%.4f > 0.02. "
+                "Results may not be stable/publishable.",
+                std_auroc,
+            )
+    else:
+        mean_auroc, std_auroc = float("nan"), float("nan")
+
+    # Save multi-seed summary
+    seed_summary = {
+        "seeds": seeds[:len(seed_aurocs)],
+        "seed_aurocs": seed_aurocs,
+        "mean_auroc": mean_auroc,
+        "std_auroc": std_auroc,
+        "high_variance_warning": bool(std_auroc > 0.02),
+    }
+    save_json(seed_summary, f"{cfg['output_dir']}/multi_seed_summary.json")
+
+    # Append to main results.json
+    try:
+        with open(results_path) as f:
+            full_report = json.load(f)
+        full_report["multi_seed"] = seed_summary
+        save_json(full_report, results_path)
+    except Exception as exc:
+        logger.warning("Could not update results.json with multi-seed summary: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Final summary print
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("FULL EXPERIMENT COMPLETE")
+    print("=" * 60)
+    print(f"Seeds evaluated: {seeds[:len(seed_aurocs)]}")
+    print(f"Main Model AUROC: {mean_auroc:.4f} ± {std_auroc:.4f}")
+    for s, a in zip(seeds, seed_aurocs):
+        print(f"  Seed {s}: AUROC = {a:.4f}" if a == a else f"  Seed {s}: AUROC = N/A")
+    if valid_aurocs and std_auroc > 0.02:
+        print("[WARN] High variance detected — check model stability.")
+    print(f"\nOutputs written to: {cfg['output_dir']}/")
+    print(f"  results.json, metrics.csv, multi_seed_summary.json")
+    print(f"  plots/: auroc_comparison, pr_curve, calibration_curve, "
+          f"domain_generalization, ablation_study")
+    print(f"  tables/: main_results_table, baseline_table, ablation_table")
     print("=" * 60)
 
 
@@ -930,8 +1542,8 @@ def parse_args():
         help="Path to JSON config file (overrides defaults)"
     )
     parser.add_argument(
-        "--mode", choices=["main", "baselines", "all"], default="all",
-        help="What to train"
+        "--mode", choices=["main", "baselines", "all", "full_experiment"], default="all",
+        help="What to train. 'full_experiment' runs multi-seed evaluation + all outputs."
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -985,10 +1597,15 @@ if __name__ == "__main__":
         cfg["run_baselines"] = False
     if args.hparam_search:
         cfg["baseline_hparam_search"] = True
-    if args.mode == "main":
+
+    if args.mode == "full_experiment":
+        run_full_experiment(cfg)
+    elif args.mode == "main":
         cfg["run_baselines"] = False
         cfg["run_ablations"] = False
+        main(cfg)
     elif args.mode == "baselines":
         cfg["run_ablations"] = False
-
-    main(cfg)
+        main(cfg)
+    else:
+        main(cfg)
