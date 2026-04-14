@@ -60,6 +60,7 @@ from eval import (
     evaluate_in_distribution,
     evaluate_out_of_hospital,
     evaluate_counterfactual,
+    monitor_disentanglement,
     generate_report,
 )
 
@@ -105,10 +106,17 @@ DEFAULT_CFG: Dict[str, Any] = {
     # GRL alpha schedule
     "grl_anneal": True,
     "grl_alpha_max": 1.0,
-    # Baselines
+    # Baselines — hyperparameter search
+    # Set baseline_hparam_search=True to run a 3×3 grid (hidden_dim × lr).
+    # When False, uses the single values in baseline_hidden_dim / baseline_lr.
     "run_baselines": True,
     "baseline_epochs": 30,
     "baseline_patience": 10,
+    "baseline_hparam_search": False,
+    "baseline_hidden_dim": 128,
+    "baseline_lr": 3e-4,
+    "baseline_hparam_hidden_dims": [64, 128, 256],
+    "baseline_hparam_lrs": [1e-3, 3e-4, 1e-4],
     "baselines_to_run": [
         "erm", "dann", "domain_confusion", "irm",
         "crn", "gnet", "rmsn", "dcrn",
@@ -117,6 +125,8 @@ DEFAULT_CFG: Dict[str, Any] = {
     # Ablations
     "run_ablations": True,
     "ablation_epochs": 20,
+    # Disentanglement monitoring (run every N epochs; 0 = only at end)
+    "monitor_disentanglement_interval": 10,
     # Output
     "output_dir": "outputs",
     "checkpoint_dir": "outputs/checkpoints",
@@ -389,11 +399,20 @@ def train_model(
         if is_best:
             best_metrics = val_metrics
             save_checkpoint(checkpoint_path, model, optimizer, epoch, val_metrics, cfg)
-            logger.info("  ✓ New best  AUROC=%.4f  →  saved to %s", val_auroc, checkpoint_path)
+            logger.info("  [BEST] New best  AUROC=%.4f  saved to %s", val_auroc, checkpoint_path)
 
         if early_stopping.should_stop:
             logger.info("Early stopping triggered at epoch %d.", epoch)
             break
+
+        # Disentanglement monitor (run every N epochs)
+        monitor_interval = cfg.get("monitor_disentanglement_interval", 10)
+        if monitor_interval > 0 and epoch % monitor_interval == 0:
+            try:
+                disent_stats = monitor_disentanglement(model, val_loader, device)
+                best_metrics["disentanglement"] = disent_stats
+            except Exception as exc:
+                logger.debug("Disentanglement monitor skipped: %s", exc)
 
     # Reload best weights
     if Path(checkpoint_path).exists():
@@ -416,9 +435,11 @@ def train_baseline(
     name: str,
     max_epochs: int = 30,
     checkpoint_path: str = "outputs/checkpoints/best_baseline.pt",
+    lr: Optional[float] = None,
 ) -> Dict[str, float]:
     """Generic training loop for baselines (outcome + reconstruction losses)."""
-    optimizer = AdamW(model.parameters(), lr=cfg.get("lr", 3e-4),
+    effective_lr = lr if lr is not None else cfg.get("lr", 3e-4)
+    optimizer = AdamW(model.parameters(), lr=effective_lr,
                       weight_decay=cfg.get("weight_decay", 1e-5))
     early_stopping = EarlyStopping(patience=cfg.get("baseline_patience", 10), mode="max")
     best_metrics: Dict[str, float] = {}
@@ -505,6 +526,91 @@ def train_baseline(
 
 
 # ---------------------------------------------------------------------------
+# Baseline hyperparameter search
+# ---------------------------------------------------------------------------
+
+def tune_baseline_hparams(
+    bl_name: str,
+    train_loader,
+    val_loader,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    checkpoint_dir: str,
+) -> Tuple[nn.Module, Dict[str, float], Dict[str, Any]]:
+    """
+    Grid search over hidden_dim × lr for a single baseline.
+
+    Grid (when baseline_hparam_search=True):
+        hidden_dim ∈ cfg["baseline_hparam_hidden_dims"]  (default [64, 128, 256])
+        lr         ∈ cfg["baseline_hparam_lrs"]          (default [1e-3, 3e-4, 1e-4])
+
+    When baseline_hparam_search=False, uses the single values
+    cfg["baseline_hidden_dim"] and cfg["baseline_lr"] (faster, for quick runs).
+
+    Returns the best model, its val metrics, and the best config dict.
+    """
+    do_search = cfg.get("baseline_hparam_search", False)
+
+    if do_search:
+        hidden_dims = cfg.get("baseline_hparam_hidden_dims", [64, 128, 256])
+        lrs = cfg.get("baseline_hparam_lrs", [1e-3, 3e-4, 1e-4])
+    else:
+        hidden_dims = [cfg.get("baseline_hidden_dim", 128)]
+        lrs = [cfg.get("baseline_lr", 3e-4)]
+
+    best_auroc = -1.0
+    best_model = None
+    best_metrics: Dict[str, float] = {}
+    best_hparams: Dict[str, Any] = {}
+
+    for hd in hidden_dims:
+        for lr_val in lrs:
+            trial_cfg = {**cfg, "hidden_dim": hd}
+            trial_id = f"hd{hd}_lr{lr_val:.0e}"
+            ckpt = f"{checkpoint_dir}/best_{bl_name}_{trial_id}.pt"
+
+            try:
+                model = build_baseline(
+                    bl_name,
+                    x_dim=cfg["num_features"],
+                    u_dim=cfg["num_treatments"],
+                    num_hospitals=cfg["num_hospitals"],
+                    hidden_dim=hd,
+                    device=device,
+                )
+                metrics = train_baseline(
+                    model, train_loader, val_loader, trial_cfg, device,
+                    name=bl_name,
+                    max_epochs=cfg.get("baseline_epochs", 30),
+                    checkpoint_path=ckpt,
+                    lr=lr_val,
+                )
+                trial_auroc = metrics.get("auroc", 0.0)
+                logger.info(
+                    "  [Baseline %s] hd=%d lr=%.0e → AUROC=%.4f",
+                    bl_name, hd, lr_val, trial_auroc,
+                )
+                if trial_auroc > best_auroc:
+                    best_auroc = trial_auroc
+                    best_model = model
+                    best_metrics = {**metrics, "hidden_dim": hd, "lr": lr_val}
+                    best_hparams = {"hidden_dim": hd, "lr": lr_val}
+            except Exception as exc:
+                logger.warning(
+                    "  [Baseline %s] hd=%d lr=%.0e failed: %s", bl_name, hd, lr_val, exc
+                )
+
+    if best_model is None:
+        raise RuntimeError(f"All hyperparameter trials failed for baseline {bl_name}")
+
+    logger.info(
+        "  [Baseline %s] Best config: %s  AUROC=%.4f",
+        bl_name, best_hparams, best_auroc,
+    )
+    return best_model, best_metrics, best_hparams
+
+
+# ---------------------------------------------------------------------------
 # Ablation helper
 # ---------------------------------------------------------------------------
 
@@ -516,7 +622,20 @@ def run_ablations_standalone(
     hospital_id_map,
     device: torch.device,
 ) -> Dict[str, Any]:
-    """Train and evaluate ablated variants of the main model."""
+    """
+    Train and evaluate ablated variants of the main model.
+
+    Ablations
+    ---------
+    no_hosp_adv    : remove hospital adversary (lambda_hosp_adv=0)
+    no_trt_adv     : remove treatment adversary (lambda_trt_adv=0)
+    no_contrastive : remove contrastive loss (lambda_contrastive=0)
+    no_adversaries : remove both adversarial heads
+    minimal_e      : minimal e_dim=4 (near-constant environment branch)
+    no_invariant_s : **KEY** ablation — outcome uses e_final only (not s_final).
+                     Tests whether the invariant s_t branch carries real predictive
+                     signal.  A large AUROC drop confirms s_t is non-trivial.
+    """
     from data import get_dataloaders
     from eval import evaluate_in_distribution
 
@@ -528,6 +647,14 @@ def run_ablations_standalone(
         "no_contrastive": {"lambda_contrastive": 0.0},
         "no_adversaries": {"lambda_hosp_adv": 0.0, "lambda_trt_adv": 0.0},
         "minimal_e": {"e_dim": 4},
+        # Most critical ablation: route outcome through e_t only, bypassing s_t.
+        # If performance drops, s_t is genuinely useful; if not, investigate collapse.
+        "no_invariant_s": {
+            "use_e_for_outcome": True,
+            "lambda_hosp_adv": 0.0,
+            "lambda_trt_adv": 0.0,
+            "lambda_contrastive": 0.0,
+        },
     }
 
     for abl_name, overrides in ablation_overrides.items():
@@ -587,11 +714,17 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
     cfg["num_treatments"] = data["num_treatments"]
     cfg["num_hospitals"] = data["num_hospitals"]
     cfg["hospital_id_map"] = data["hospital_id_map"]
+    hospital_valid = data.get("hospital_valid", True)
 
     logger.info(
-        "Data ready: %d features, %d treatments, %d hospitals",
-        cfg["num_features"], cfg["num_treatments"], cfg["num_hospitals"],
+        "Data ready: %d features, %d treatments, %d hospitals (hospital_valid=%s)",
+        cfg["num_features"], cfg["num_treatments"], cfg["num_hospitals"], hospital_valid,
     )
+    if not hospital_valid:
+        logger.warning(
+            "Hospital column is not valid for cross-hospital generalisation. "
+            "OOH experiments will run but results should be interpreted with caution."
+        )
     save_json(
         {k: v for k, v in cfg.items() if k != "hospital_id_map"},
         f"{cfg['output_dir']}/config.json",
@@ -647,36 +780,30 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
             )
         logger.info("Main model OOH results: %s", ooh_result)
 
-    # Counterfactual
-    cf_result = evaluate_counterfactual(main_model, test_loader, device)
-    logger.info("Counterfactual results: %s", cf_result)
-
     # ------------------------------------------------------------------
-    # Baselines
+    # Baselines — with optional hyperparameter search
     # ------------------------------------------------------------------
     trained_baselines: Dict[str, nn.Module] = {}
+    baseline_best_hparams: Dict[str, Any] = {}
 
     if cfg.get("run_baselines", True):
-        logger.info("Training baselines…")
+        logger.info(
+            "Training baselines (hparam_search=%s)…",
+            cfg.get("baseline_hparam_search", False),
+        )
         for bl_name in cfg.get("baselines_to_run", list(BASELINE_REGISTRY.keys())):
             logger.info("  → %s", bl_name)
             try:
-                bl_model = build_baseline(
+                bl_model, bl_metrics, bl_hparams = tune_baseline_hparams(
                     bl_name,
-                    x_dim=cfg["num_features"],
-                    u_dim=cfg["num_treatments"],
-                    num_hospitals=cfg["num_hospitals"],
-                    hidden_dim=cfg.get("hidden_dim", 128),
-                    device=device,
-                )
-                ckpt_bl = f"{cfg['checkpoint_dir']}/best_{bl_name}.pt"
-                train_baseline(
-                    bl_model, train_loader, val_loader, cfg, device,
-                    name=bl_name,
-                    max_epochs=cfg.get("baseline_epochs", 30),
-                    checkpoint_path=ckpt_bl,
+                    train_loader,
+                    val_loader,
+                    cfg,
+                    device,
+                    cfg["checkpoint_dir"],
                 )
                 trained_baselines[bl_name] = bl_model
+                baseline_best_hparams[bl_name] = bl_hparams
             except Exception as exc:
                 logger.error("Failed to train baseline %s: %s", bl_name, exc, exc_info=True)
 
@@ -709,32 +836,86 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
         output_path=cfg["results_path"],
     )
 
-    # Augment with OOH training result and ablations
+    # Augment with OOH training result, ablations and hparam search results
     if ooh_result:
         report["main_model_ooh_dedicated"] = ooh_result
     report["ablations"] = ablation_results
+    report["baseline_best_hparams"] = baseline_best_hparams
+    report["hospital_valid"] = hospital_valid
 
     save_json(report, cfg["results_path"])
     logger.info("=" * 60)
     logger.info("DONE. Results saved to %s", cfg["results_path"])
     logger.info("=" * 60)
 
-    # Print summary
+    # ------------------------------------------------------------------
+    # Human-readable summary
+    # ------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("RESULTS SUMMARY")
     print("=" * 60)
-    print(f"Main model (in-distribution): {indist['metrics']}")
+
+    m = indist["metrics"]
+    print(
+        f"Main model (in-distribution):"
+        f"  AUROC={m.get('auroc', float('nan')):.4f}"
+        f"  AUPRC={m.get('auprc', float('nan')):.4f}"
+        f"  ACC={m.get('accuracy', float('nan')):.4f}"
+        f"  ECE={m.get('ece', float('nan')):.4f}"   # required calibration metric
+    )
     if ooh_result:
-        print(f"Main model (out-of-hospital): {ooh_result}")
-    print(f"Counterfactual: {cf_result}")
+        ooh_m = ooh_result.get("out_of_hospital", {})
+        print(
+            f"Main model (out-of-hospital):"
+            f"  AUROC={ooh_m.get('auroc', float('nan')):.4f}"
+            f"  ECE={ooh_m.get('ece', float('nan')):.4f}"
+            f"  ΔAUROC_drop={ooh_result.get('domain_shift', {}).get('auroc_drop', float('nan')):.4f}"
+        )
+
+    # ΔAUROC vs best baseline
+    auroc_cmp = report.get("auroc_comparison", {})
+    if auroc_cmp:
+        if auroc_cmp.get("main_model_competitive"):
+            competitive = "[PASS]"
+        else:
+            competitive = "[WARN] BELOW BASELINE"
+        print(
+            f"\nAUROC competitiveness {competitive}:"
+            f"  main={auroc_cmp.get('main_model_auroc', float('nan')):.4f}"
+            f"  best_baseline={auroc_cmp.get('best_baseline_name')} "
+            f"({auroc_cmp.get('best_baseline_auroc', float('nan')):.4f})"
+            f"  DELTA_AUROC={sign}{auroc_cmp.get('delta_auroc', float('nan')):.4f}"
+        )
+
     print(f"\nBaselines:")
     for bname, bm in report.get("baselines", {}).items():
         if not bname.endswith("_ooh"):
-            print(f"  {bname:25s}: AUROC={bm.get('auroc', float('nan')):.4f}")
+            hparams = baseline_best_hparams.get(bname, {})
+            print(
+                f"  {bname:25s}: AUROC={bm.get('auroc', float('nan')):.4f}"
+                f"  ECE={bm.get('ece', float('nan')):.4f}"
+                + (f"  [hd={hparams.get('hidden_dim')} lr={hparams.get('lr'):.0e}]"
+                   if hparams else "")
+            )
+
     if ablation_results:
         print(f"\nAblations:")
         for aname, am in ablation_results.items():
-            print(f"  {aname:25s}: AUROC={am.get('auroc', float('nan')):.4f}")
+            flag = "← KEY: tests if s_t carries signal" if aname == "no_invariant_s" else ""
+            print(
+                f"  {aname:25s}: AUROC={am.get('auroc', float('nan')):.4f}"
+                f"  ECE={am.get('ece', float('nan')):.4f}  {flag}"
+            )
+
+    disent = report.get("disentanglement_monitor", {})
+    if disent:
+        collapse = "[WARN] COLLAPSE DETECTED" if disent.get("collapse_warning") else "[OK]"
+        print(
+            f"\nDisentanglement monitor: s_var={disent.get('s_var_mean', float('nan')):.4e}"
+            f"  recon_degradation={disent.get('recon_degradation_frac', float('nan')):.2%}"
+            f"  [{collapse}]"
+        )
+
     print("=" * 60)
 
 
@@ -765,6 +946,10 @@ def parse_args():
     parser.add_argument(
         "--no_baselines", action="store_true",
         help="Skip baselines"
+    )
+    parser.add_argument(
+        "--hparam_search", action="store_true",
+        help="Enable baseline hyperparameter grid search (hidden_dim × lr)"
     )
     return parser.parse_args()
 
@@ -798,6 +983,8 @@ if __name__ == "__main__":
         cfg["run_ablations"] = False
     if args.no_baselines:
         cfg["run_baselines"] = False
+    if args.hparam_search:
+        cfg["baseline_hparam_search"] = True
     if args.mode == "main":
         cfg["run_baselines"] = False
         cfg["run_ablations"] = False

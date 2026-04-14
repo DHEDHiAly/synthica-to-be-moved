@@ -134,6 +134,86 @@ def _binarize_outcome(series: pd.Series) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
+# Hospital column validation
+# ---------------------------------------------------------------------------
+
+#: Minimum number of distinct hospitals required to make cross-hospital claims.
+_MIN_HOSPITALS = 3
+#: Minimum fraction of total patients that a hospital must cover to be "non-trivial".
+#: Hospitals with fewer than 1% of patients are too small for meaningful cross-hospital
+#: evaluation — they provide insufficient test-set signal.  Such hospitals are logged
+#: as warnings but are kept in the training set rather than used as held-out test environments.
+_MIN_HOSPITAL_PATIENT_FRACTION = 0.01
+
+
+def validate_hospital_column(
+    df: pd.DataFrame,
+    patient_col: str,
+    hospital_col: str,
+) -> bool:
+    """
+    Validate that the hospital column is suitable for cross-hospital generalization.
+
+    Checks:
+      1. At least _MIN_HOSPITALS unique hospital values.
+      2. No single hospital contains > 95% of all patients (non-degenerate).
+      3. Each hospital contains at least _MIN_HOSPITAL_PATIENT_FRACTION of patients.
+
+    Logs full distribution statistics.
+
+    Returns
+    -------
+    True if the column is a valid environment variable for invariance claims.
+    False if the column should be treated as degenerate (disables OOH claim).
+    """
+    patient_level = df.groupby(patient_col)[hospital_col].first()
+    n_patients = len(patient_level)
+    hospital_counts = patient_level.value_counts()
+    n_hospitals = len(hospital_counts)
+
+    logger.info(
+        "[HospitalValidation] Column '%s': %d unique hospitals, %d patients",
+        hospital_col, n_hospitals, n_patients,
+    )
+    logger.info(
+        "[HospitalValidation] Patients per hospital (top-10): %s",
+        hospital_counts.head(10).to_dict(),
+    )
+
+    if n_hospitals < _MIN_HOSPITALS:
+        logger.warning(
+            "[HospitalValidation] FAIL: only %d hospital(s) found (need ≥%d). "
+            "Cross-hospital generalisation claim is DISABLED.",
+            n_hospitals, _MIN_HOSPITALS,
+        )
+        return False
+
+    max_frac = hospital_counts.max() / n_patients
+    if max_frac > 0.95:
+        logger.warning(
+            "[HospitalValidation] FAIL: one hospital contains %.1f%% of patients — "
+            "distribution is degenerate.  Cross-hospital claim is DISABLED.",
+            max_frac * 100,
+        )
+        return False
+
+    # Check no hospital is too small to be meaningful
+    tiny = hospital_counts[hospital_counts / n_patients < _MIN_HOSPITAL_PATIENT_FRACTION]
+    if len(tiny) > 0:
+        logger.warning(
+            "[HospitalValidation] %d hospital(s) have < %.1f%% of patients: %s  "
+            "(will be held in training set only)",
+            len(tiny), _MIN_HOSPITAL_PATIENT_FRACTION * 100, tiny.index.tolist()[:5],
+        )
+
+    logger.info(
+        "[HospitalValidation] PASS: %d hospitals, max_patient_frac=%.2f",
+        n_hospitals, max_frac,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -152,7 +232,12 @@ def discover_schema(df: pd.DataFrame) -> Dict[str, object]:
     """
     Programmatically identify column roles.  Every decision is logged.
     Returns a dict with keys: patient_col, hospital_col, time_col,
-    outcome_col, feature_cols, treatment_cols.
+    outcome_col, feature_cols, treatment_cols, hospital_valid.
+
+    ``hospital_valid`` is False when the hospital column does not have enough
+    unique values / non-trivial distribution to support cross-hospital claims.
+    When False, callers should disable out-of-hospital split experiments and
+    suppress the hospital-invariance scientific claim.
     """
     patient_col = _find_col(df, _PATIENT_CANDIDATES)
     hospital_col = _find_col(df, _HOSPITAL_CANDIDATES)
@@ -173,11 +258,14 @@ def discover_schema(df: pd.DataFrame) -> Dict[str, object]:
         )
 
     # Fallback: synthesise a dummy hospital label if none found
+    hospital_valid = True
     if hospital_col is None:
         hospital_col = "__hospital__"
         df[hospital_col] = 0
+        hospital_valid = False
         logger.warning(
-            "[Schema] No hospital column found; using constant hospital label 0."
+            "[Schema] No hospital column found; using constant hospital label 0.  "
+            "Cross-hospital generalisation claim is DISABLED."
         )
 
     # Fallback: if no time column, assume rows are already ordered chronologically
@@ -202,6 +290,10 @@ def discover_schema(df: pd.DataFrame) -> Dict[str, object]:
             "[Schema] No outcome column found; synthesising random binary outcome."
         )
 
+    # Validate hospital column if it was found or synthesised
+    if hospital_valid:
+        hospital_valid = validate_hospital_column(df, patient_col, hospital_col)
+
     exclude = [c for c in [patient_col, hospital_col, time_col, outcome_col] if c is not None]
     treatment_cols = _infer_treatment_cols(df, exclude)
     feature_cols = _infer_feature_cols(df, exclude + treatment_cols)
@@ -225,6 +317,7 @@ def discover_schema(df: pd.DataFrame) -> Dict[str, object]:
         "outcome_col": outcome_col,
         "feature_cols": feature_cols,
         "treatment_cols": treatment_cols,
+        "hospital_valid": hospital_valid,
     }
 
 
@@ -549,6 +642,7 @@ def load_and_prepare(
         "num_treatments": max(len(schema["treatment_cols"]), 1),
         "num_hospitals": num_hospitals,
         "hospital_id_map": hospital_id_map,
+        "hospital_valid": schema.get("hospital_valid", True),
         "sequences": sequences,
         "scaler_x": scaler_x,
         "scaler_u": scaler_u,
@@ -558,6 +652,12 @@ def load_and_prepare(
     }
 
     if split_mode == "out_of_hospital":
+        if not schema.get("hospital_valid", True):
+            logger.warning(
+                "split_mode='out_of_hospital' requested but hospital column is not "
+                "valid for cross-hospital evaluation.  Falling back to random split "
+                "for OOH loaders (same data, different seed)."
+            )
         tr_ooh, va_ooh, te_ooh, held = out_of_hospital_split(sequences, seed=seed)
         _, _, ooh_test_loader = get_dataloaders(
             tr_ooh, va_ooh, te_ooh, batch_size=batch_size, hospital_id_map=hospital_id_map

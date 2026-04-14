@@ -247,10 +247,21 @@ class DisentangledICUModel(nn.Module):
         num_trt_classes: int = 2,
         proj_dim: int = 64,
         grl_alpha: float = 1.0,
+        use_e_for_outcome: bool = False,
     ) -> None:
+        """
+        Parameters
+        ----------
+        use_e_for_outcome : bool
+            When True, the outcome head is applied to e_final instead of s_final.
+            This is used for the "no_invariant_s" ablation study, which tests whether
+            the invariant s_t branch actually carries predictive signal.  If removing
+            s_t causes a large performance drop, it confirms s_t is non-trivial.
+        """
         super().__init__()
         self.s_dim = s_dim
         self.e_dim = e_dim
+        self.use_e_for_outcome = use_e_for_outcome
 
         self.encoder = GRUEncoder(x_dim, u_dim, hidden_dim, s_dim, e_dim,
                                   enc_layers, enc_dropout)
@@ -259,7 +270,9 @@ class DisentangledICUModel(nn.Module):
         # Note: dynamics modules use hidden_dim // 2 to keep parameter count balanced
         # relative to the larger encoder while avoiding overfitting in the dynamics.
         self.decoder = Decoder(s_dim, e_dim, x_dim, hidden_dim)
-        self.outcome_head = OutcomeHead(s_dim, hidden_dim // 2)
+        # Outcome head dimension depends on ablation mode.
+        outcome_in_dim = e_dim if use_e_for_outcome else s_dim
+        self.outcome_head = OutcomeHead(outcome_in_dim, hidden_dim // 2)
         self.hosp_adversary = HospitalAdversary(s_dim, num_hospitals,
                                                 hidden_dim // 2, grl_alpha)
         self.trt_adversary = TreatmentAdversary(s_dim, num_trt_classes,
@@ -285,13 +298,18 @@ class DisentangledICUModel(nn.Module):
         # 3. Decode next-step
         x_pred = self.decoder(s_next, e_next)  # (B, T, x_dim)
 
-        # 4. Outcome from final valid invariant state
+        # 4. Outcome from final valid state (invariant branch or env branch)
         if mask is not None:
             seq_lens = mask.long().sum(dim=1).clamp(min=1) - 1  # (B,)
             s_final = s[torch.arange(B, device=s.device), seq_lens]
+            e_final = e[torch.arange(B, device=e.device), seq_lens]
         else:
             s_final = s[:, -1]                  # (B, s_dim)
-        outcome_logit = self.outcome_head(s_final)
+            e_final = e[:, -1]                  # (B, e_dim)
+
+        # use_e_for_outcome=True → ablation: outcome predicted from e_t only
+        outcome_input = e_final if self.use_e_for_outcome else s_final
+        outcome_logit = self.outcome_head(outcome_input)
 
         # 5. Adversarial heads — flatten time, optionally apply mask
         if mask is not None:
@@ -316,6 +334,7 @@ class DisentangledICUModel(nn.Module):
             "e_next": e_next,
             "s_proj": s_proj,
             "s_final": s_final,
+            "e_final": e_final,
         }
 
     # ------------------------------------------------------------------
@@ -382,5 +401,6 @@ def build_model(cfg: Dict, device: torch.device) -> DisentangledICUModel:
         num_trt_classes=cfg.get("num_trt_classes", 2),
         proj_dim=cfg.get("proj_dim", 64),
         grl_alpha=cfg.get("grl_alpha", 1.0),
+        use_e_for_outcome=cfg.get("use_e_for_outcome", False),
     )
     return model.to(device)
