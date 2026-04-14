@@ -16,6 +16,7 @@ generate_report           — Full report: ΔAUROC, calibration, OOH, counterfac
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -625,7 +626,7 @@ def generate_report(
     st_probe = compute_st_probe_auroc(main_model, test_loader, device)
     report["st_probe_auroc"] = st_probe
     _ST_PROBE_THRESHOLD = 0.60
-    if not (st_probe != st_probe) and st_probe < _ST_PROBE_THRESHOLD:  # nan-safe
+    if not math.isnan(st_probe) and st_probe < _ST_PROBE_THRESHOLD:
         logger.warning(
             "[WARN] s_t probe AUROC=%.4f is below threshold %.2f — "
             "invariant branch may not carry genuine predictive signal.",
@@ -634,7 +635,6 @@ def generate_report(
     else:
         logger.info("[OK] s_t probe AUROC=%.4f → VALID (threshold=%.2f)",
                     st_probe, _ST_PROBE_THRESHOLD)
-
     # ------------------------------------------------------------------
     # Main model — out-of-hospital
     # ------------------------------------------------------------------

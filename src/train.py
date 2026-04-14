@@ -930,7 +930,7 @@ def _print_final_summary(
     if auroc_cmp:
         status = auroc_cmp.get("competitive_status", "N/A")
         delta = auroc_cmp.get("delta_auroc", float("nan"))
-        sign = "+" if (delta == delta and delta >= 0) else ""
+        sign = "+" if (not math.isnan(delta) and delta >= 0) else ""
         print(
             f"\nAUROC competitiveness [{status}]:"
             f"  main={auroc_cmp.get('main_model_auroc', float('nan')):.4f}"
@@ -1032,7 +1032,7 @@ def generate_plots(
     ax.set_title("AUROC Comparison: Baselines vs Main Model")
     ax.axvline(x=0.5, color="gray", linestyle="--", linewidth=0.8, label="Random")
     for bar, val in zip(bars, aurocs):
-        if val == val:  # not nan
+        if not math.isnan(val):
             ax.text(bar.get_width() + 0.002, bar.get_y() + bar.get_height() / 2,
                     f"{val:.3f}", va="center", fontsize=8)
     ax.set_xlim(0.4, 1.05)
@@ -1121,7 +1121,7 @@ def generate_plots(
         model_names_dg.append("Main Model")
         indist_aurocs.append(in_a)
         ood_aurocs.append(ood_a)
-        gaps.append(in_a - ood_a if (in_a == in_a and ood_a == ood_a) else float("nan"))
+        gaps.append(in_a - ood_a if (not math.isnan(in_a) and not math.isnan(ood_a)) else float("nan"))
 
     for bname, bdata in report.get("baselines", {}).items():
         if "_ooh" not in bname:
@@ -1132,7 +1132,7 @@ def generate_plots(
         model_names_dg.append(bl_base)
         indist_aurocs.append(in_a)
         ood_aurocs.append(ood_a)
-        gaps.append(in_a - ood_a if (in_a == in_a and ood_a == ood_a) else float("nan"))
+        gaps.append(in_a - ood_a if (not math.isnan(in_a) and not math.isnan(ood_a)) else float("nan"))
 
     if model_names_dg:
         x = np.arange(len(model_names_dg))
@@ -1147,7 +1147,7 @@ def generate_plots(
         ax.legend()
         # Annotate gaps
         for i, g in enumerate(gaps):
-            if g == g:  # not nan
+            if not math.isnan(g):  # not nan
                 ax.annotate(f"Gap={g:.3f}", xy=(i, max(indist_aurocs[i], ood_aurocs[i]) + 0.01),
                             ha="center", fontsize=7, color="darkred")
         fig.tight_layout()
@@ -1175,11 +1175,11 @@ def generate_plots(
     bars = ax.barh(abl_names_plot, abl_aurocs_plot, color=abl_colors_plot)
     ax.set_xlabel("AUROC")
     ax.set_title("Ablation Study")
-    if main_auroc_val == main_auroc_val:
+    if not math.isnan(main_auroc_val):
         ax.axvline(x=main_auroc_val, color="#2a9d8f", linestyle="--", lw=1.5,
                    label=f"Full Model ({main_auroc_val:.3f})")
     for bar, val in zip(bars, abl_aurocs_plot):
-        if val == val:
+        if not math.isnan(val):
             ax.text(bar.get_width() + 0.002, bar.get_y() + bar.get_height() / 2,
                     f"{val:.3f}", va="center", fontsize=8)
     ax.set_xlim(0.3, 1.05)
@@ -1221,7 +1221,7 @@ def generate_tables(
     main_ooh_auroc = _fmt(main_ooh.get("out_of_hospital", {}).get("auroc") if main_ooh else None)
     main_gap = _fmt(main_ooh.get("domain_shift", {}).get("auroc_drop") if main_ooh else None)
     delta_auroc = auroc_cmp.get("delta_auroc", float("nan"))
-    delta_sign = "+" if (delta_auroc == delta_auroc and delta_auroc >= 0) else ""
+    delta_sign = "+" if (not math.isnan(delta_auroc) and delta_auroc >= 0) else ""
 
     with open(str(tables_dir / "main_results_table.csv"), "w", newline="") as f:
         writer = csv.writer(f)
@@ -1474,7 +1474,7 @@ def run_full_experiment(cfg: Dict[str, Any]) -> None:
     # ------------------------------------------------------------------
     # Multi-seed summary
     # ------------------------------------------------------------------
-    valid_aurocs = [a for a in seed_aurocs if a == a]  # filter nan
+    valid_aurocs = [a for a in seed_aurocs if not math.isnan(a)]  # filter nan
     if valid_aurocs:
         mean_auroc = float(np.mean(valid_aurocs))
         std_auroc = float(np.std(valid_aurocs))
@@ -1520,7 +1520,7 @@ def run_full_experiment(cfg: Dict[str, Any]) -> None:
     print(f"Seeds evaluated: {seeds[:len(seed_aurocs)]}")
     print(f"Main Model AUROC: {mean_auroc:.4f} ± {std_auroc:.4f}")
     for s, a in zip(seeds, seed_aurocs):
-        print(f"  Seed {s}: AUROC = {a:.4f}" if a == a else f"  Seed {s}: AUROC = N/A")
+        print(f"  Seed {s}: AUROC = {a:.4f}" if not math.isnan(a) else f"  Seed {s}: AUROC = N/A")
     if valid_aurocs and std_auroc > 0.02:
         print("[WARN] High variance detected — check model stability.")
     print(f"\nOutputs written to: {cfg['output_dir']}/")
@@ -1543,7 +1543,14 @@ def parse_args():
     )
     parser.add_argument(
         "--mode", choices=["main", "baselines", "all", "full_experiment"], default="all",
-        help="What to train. 'full_experiment' runs multi-seed evaluation + all outputs."
+        help=(
+            "What to train: 'main' trains only the main model (no baselines, no ablations); "
+            "'baselines' trains baselines + main model (no ablations); "
+            "'all' runs the complete single-seed pipeline (baselines + main model + ablations); "
+            "'full_experiment' runs the full multi-seed pipeline (seeds=42,43,44) with "
+            "all baselines + ablations on seed-42, main model on remaining seeds, and "
+            "generates all output files (plots, tables, metrics.csv)."
+        )
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
