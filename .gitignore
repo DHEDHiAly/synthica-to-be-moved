@@ -1,3 +1,27 @@
+# Dataset (download separately)
+data/eicu_final_sequences_for_modeling.csv
+
+# Generated outputs (not committed)
+outputs/results.json
+outputs/*.json
+outputs/checkpoints/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Virtual environments
+.env
 # Data files (download separately)
 data/eicu_final_sequences_for_modeling.csv
 
@@ -13,6 +37,10 @@ __pycache__/
 venv/
 env/
 
+# IDE
+.vscode/
+.idea/
+*.swp
 # Outputs (checkpoints, logs, results)
 outputs/
 
