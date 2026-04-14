@@ -509,6 +509,7 @@ def disentanglement_check(
         )
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -1260,6 +1261,62 @@ def run_ablations(
 
 
 # ---------------------------------------------------------------------------
+# s_t linear probe AUROC
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_st_probe_auroc(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> float:
+    """
+    Train a logistic regression probe on frozen s_final embeddings to predict outcome.
+
+    A high AUROC confirms the invariant s_t branch carries genuine predictive signal.
+    A low AUROC (< 0.55) suggests s_t has collapsed or is not informative.
+    """
+    model.eval()
+    all_s_final: List[np.ndarray] = []
+    all_y: List[np.ndarray] = []
+
+    for batch in loader:
+        x = batch["x"].to(device)
+        u = batch["u"].to(device)
+        mask = batch["mask"].to(device)
+        y = batch["y"]
+
+        if hasattr(model, "encoder"):
+            out = model(x, u, mask)
+            s_final = out.get("s_final")
+            if s_final is not None:
+                all_s_final.append(s_final.cpu().numpy())
+                all_y.append(y.numpy())
+
+    if not all_s_final:
+        return float("nan")
+
+    s_np = np.concatenate(all_s_final)
+    y_np = np.concatenate(all_y)
+
+    if len(np.unique(y_np)) < 2:
+        return float("nan")
+
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+
+        s_scaled = StandardScaler().fit_transform(s_np)
+        clf = LogisticRegression(max_iter=1000, C=0.1, random_state=42, solver="lbfgs")
+        clf.fit(s_scaled, y_np)
+        probs = clf.predict_proba(s_scaled)[:, 1]
+        return safe_auroc(y_np, probs)
+    except Exception as exc:
+        logger.warning("s_t probe AUROC computation failed: %s", exc)
+        return float("nan")
+
+
+# ---------------------------------------------------------------------------
 # Full evaluation report
 # ---------------------------------------------------------------------------
 
@@ -1281,7 +1338,8 @@ def generate_report(
     - Counterfactual proxy evaluation (all 3 strategies)
     - Disentanglement monitoring (latent collapse + e_t degradation check)
     - All baselines with the same metric set
-    - **ΔAUROC** = main model AUROC − best baseline AUROC (flagged if negative)
+    - **ΔAUROC** = main model AUROC − best baseline AUROC (PASS/COMPETITIVE/NOT_COMPETITIVE)
+    - s_t probe AUROC — confirms invariant branch carries predictive signal
     - Per-hospital breakdown for main model
     """
     report: Dict[str, Any] = {}
@@ -1293,6 +1351,9 @@ def generate_report(
     indist_result = evaluate_in_distribution(main_model, test_loader, device,
                                              is_disentangled=True)
     report["main_model_indist"] = indist_result["metrics"]
+    # Store raw predictions for plot generation
+    report["_main_model_probs"] = indist_result["probs"].tolist()
+    report["_main_model_labels"] = indist_result["labels"].tolist()
 
     # Per-hospital breakdown
     ph = evaluate_per_hospital(
@@ -1300,6 +1361,22 @@ def generate_report(
     )
     report["main_model_per_hospital"] = ph
 
+    # ------------------------------------------------------------------
+    # s_t linear probe AUROC (confirms invariant branch has signal)
+    # ------------------------------------------------------------------
+    logger.info("Computing s_t linear probe AUROC…")
+    st_probe = compute_st_probe_auroc(main_model, test_loader, device)
+    report["st_probe_auroc"] = st_probe
+    _ST_PROBE_THRESHOLD = 0.60
+    if not math.isnan(st_probe) and st_probe < _ST_PROBE_THRESHOLD:
+        logger.warning(
+            "[WARN] s_t probe AUROC=%.4f is below threshold %.2f — "
+            "invariant branch may not carry genuine predictive signal.",
+            st_probe, _ST_PROBE_THRESHOLD,
+        )
+    else:
+        logger.info("[OK] s_t probe AUROC=%.4f → VALID (threshold=%.2f)",
+                    st_probe, _ST_PROBE_THRESHOLD)
     # ------------------------------------------------------------------
     # Main model — out-of-hospital
     # ------------------------------------------------------------------
@@ -1339,12 +1416,14 @@ def generate_report(
     # Baselines
     # ------------------------------------------------------------------
     report["baselines"] = {}
+    report["_baseline_probs"] = {}
     for name, bl_model in baselines.items():
         logger.info("Evaluating baseline: %s", name)
         bl_result = evaluate_in_distribution(bl_model, test_loader, device,
                                              is_disentangled=False)
         # ECE is always included in compute_all_metrics
         report["baselines"][name] = bl_result["metrics"]
+        report["_baseline_probs"][name] = bl_result["probs"].tolist()
         if ooh_test_loader is not None:
             try:
                 ooh_bl = evaluate_out_of_hospital(
@@ -1356,7 +1435,7 @@ def generate_report(
                 logger.warning("OOH evaluation failed for baseline %s: %s", name, exc)
 
     # ------------------------------------------------------------------
-    # ΔAUROC: main model vs best baseline
+    # ΔAUROC: main model vs best baseline (PASS / COMPETITIVE / NOT_COMPETITIVE)
     # ------------------------------------------------------------------
     main_auroc = report["main_model_indist"].get("auroc", float("nan"))
     baseline_aurocs = {
@@ -1368,18 +1447,35 @@ def generate_report(
         best_bl_name = max(baseline_aurocs, key=lambda k: baseline_aurocs[k])
         best_bl_auroc = baseline_aurocs[best_bl_name]
         delta_auroc = main_auroc - best_bl_auroc
+
+        # Trichotomy: PASS (≥0) / COMPETITIVE (≥-0.01) / NOT_COMPETITIVE (otherwise)
+        if delta_auroc >= 0:
+            competitive_status = "PASS"
+        elif delta_auroc >= -0.01:
+            competitive_status = "COMPETITIVE"
+        else:
+            competitive_status = "NOT_COMPETITIVE"
+
         report["auroc_comparison"] = {
             "main_model_auroc": main_auroc,
             "best_baseline_name": best_bl_name,
             "best_baseline_auroc": best_bl_auroc,
             "delta_auroc": delta_auroc,
             "main_model_competitive": bool(delta_auroc >= 0),
+            "competitive_status": competitive_status,
         }
-        if delta_auroc < 0:
+
+        if competitive_status == "NOT_COMPETITIVE":
             logger.warning(
-                "[WARN] Main model AUROC (%.4f) is BELOW best baseline %s (%.4f) "
-                "by delta_AUROC=%.4f.  Investigate disentanglement quality or "
-                "increase training epochs / model capacity.",
+                "[NOT_COMPETITIVE] Main model AUROC (%.4f) is BELOW best baseline %s "
+                "(%.4f) by delta_AUROC=%.4f (< -0.01). Investigate disentanglement "
+                "quality or increase training epochs / model capacity.",
+                main_auroc, best_bl_name, best_bl_auroc, delta_auroc,
+            )
+        elif competitive_status == "COMPETITIVE":
+            logger.warning(
+                "[COMPETITIVE] Main model AUROC (%.4f) is within -0.01 of best "
+                "baseline %s (%.4f). delta_AUROC=%.4f",
                 main_auroc, best_bl_name, best_bl_auroc, delta_auroc,
             )
         else:
