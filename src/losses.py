@@ -69,7 +69,7 @@ def irm_penalty(
     """
     unique_envs = env_ids.unique()
     if len(unique_envs) < 2:
-        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        return logits.sum() * 0.0  # zero with gradient flow
 
     w = torch.ones(1, device=logits.device, requires_grad=True)
     penalties = []
@@ -84,7 +84,7 @@ def irm_penalty(
         penalties.append(grad ** 2)
 
     if not penalties:
-        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        return logits.sum() * 0.0  # zero with gradient flow
     return torch.stack(penalties).mean()
 
 

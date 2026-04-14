@@ -273,7 +273,7 @@ def tune_baseline(
 
     for hidden_dim, lr, dropout in grid:
         for trial in range(k_trials):
-            seed = SEED + trial * 1000 + hash((name, hidden_dim, lr, dropout)) % 1000
+            seed = SEED + trial * 1000 + abs(hash((name, hidden_dim, lr, dropout))) % 1000
             set_seed(seed)
 
             try:

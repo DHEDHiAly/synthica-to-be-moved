@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 
@@ -235,7 +236,6 @@ def build_sequences(
     if scaler is None:
         scaler = StandardScaler()
     # Always fit if not yet fitted (i.e. first call), regardless of fit_scaler flag
-    from sklearn.exceptions import NotFittedError
     try:
         scaler.transform(df[feat_cols].values[:1])
     except NotFittedError:

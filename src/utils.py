@@ -1,5 +1,6 @@
 """Utility helpers: seeding, early stopping, logging."""
 
+import copy
 import logging
 import random
 import numpy as np
@@ -47,7 +48,6 @@ class EarlyStopping:
         if score > self.best_score + self.min_delta:
             self.best_score = score
             self.counter = 0
-            import copy
             self.best_state = copy.deepcopy(model_state)
         else:
             self.counter += 1

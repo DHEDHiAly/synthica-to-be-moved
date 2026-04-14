@@ -15,8 +15,10 @@ Includes:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
@@ -95,7 +97,6 @@ def compute_ece(
         ece += (count / n) * abs(avg_conf - avg_acc)
 
     if save_path:
-        import json, os
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
         with open(save_path, "w") as fh:
             json.dump({"ece": ece, "bins": bin_stats}, fh, indent=2)
