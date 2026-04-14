@@ -1624,7 +1624,7 @@ if __name__ == "__main__":
         full_experiment()
     else:
         main()
-def main(cfg: Optional[Dict[str, Any]] = None) -> None:
+def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if cfg is None:
         cfg = DEFAULT_CFG.copy()
 
@@ -1697,6 +1697,8 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
     # Evaluate main model (in-distribution)
     indist = evaluate_in_distribution(main_model, test_loader, device)
     logger.info("Main model in-dist metrics: %s", indist["metrics"])
+    print("[DEBUG] Main model metrics:", indist["metrics"])
+    assert "auroc" in indist["metrics"], "Main model missing AUROC"
 
     # Evaluate main model (out-of-hospital)
     ooh_result = None
@@ -1732,6 +1734,7 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
         )
         for bl_name in cfg.get("baselines_to_run", list(BASELINE_REGISTRY.keys())):
             logger.info("  → %s", bl_name)
+            print(f"[DEBUG] Training baseline: {bl_name}")
             try:
                 bl_model, bl_metrics, bl_hparams = tune_baseline_hparams(
                     bl_name,
@@ -1743,6 +1746,7 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
                 )
                 trained_baselines[bl_name] = bl_model
                 baseline_best_hparams[bl_name] = bl_hparams
+                print(f"[DEBUG] Finished baseline: {bl_name}, AUROC={bl_metrics.get('auroc') if isinstance(bl_metrics, dict) else 'N/A'}")
             except Exception as exc:
                 logger.error("Failed to train baseline %s: %s", bl_name, exc, exc_info=True)
 
@@ -1766,6 +1770,7 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
     # Full report
     # ------------------------------------------------------------------
     logger.info("Generating full report…")
+    print("[DEBUG] Running s_t probe...")
     report = generate_report(
         main_model=main_model,
         baselines=trained_baselines,
@@ -1774,6 +1779,8 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
         device=device,
         output_path=cfg["results_path"],
     )
+    st_probe = report.get("st_probe_auroc", float("nan"))
+    print(f"[DEBUG] s_t probe AUROC: {st_probe}")
 
     # Augment with OOH training result, ablations and hparam search results
     if ooh_result:
@@ -1782,11 +1789,84 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
     report["baseline_best_hparams"] = baseline_best_hparams
     report["hospital_valid"] = hospital_valid
 
+    # ------------------------------------------------------------------
+    # Canonical key aliases expected by downstream consumers
+    # ------------------------------------------------------------------
+    report["baseline_results"] = report.get("baselines", {})
+    report["main_model"] = report.get("main_model_indist", {})
+
+    # ------------------------------------------------------------------
+    # Force ΔAUROC computation (Step 4)
+    # ------------------------------------------------------------------
+    if "auroc_comparison" not in report:
+        _bl_aurocs = {
+            n: m.get("auroc", float("nan"))
+            for n, m in report.get("baselines", {}).items()
+            if "_ooh" not in n and isinstance(m, dict) and "auroc" in m
+        }
+        _main_auroc = report.get("main_model_indist", {}).get("auroc", float("nan"))
+        if _bl_aurocs and not math.isnan(_main_auroc):
+            _best_name = max(_bl_aurocs, key=lambda k: _bl_aurocs[k])
+            _best_auroc = _bl_aurocs[_best_name]
+            _delta = _main_auroc - _best_auroc
+            if _delta >= 0:
+                _status = "PASS"
+            elif _delta >= -0.01:
+                _status = "COMPETITIVE"
+            else:
+                _status = "NOT_COMPETITIVE"
+            report["auroc_comparison"] = {
+                "main_model_auroc": _main_auroc,
+                "best_baseline_name": _best_name,
+                "best_baseline_auroc": _best_auroc,
+                "delta_auroc": _delta,
+                "competitive_status": _status,
+            }
+
+    auroc_cmp = report.get("auroc_comparison", {})
+    print(f"[DEBUG] ΔAUROC: {auroc_cmp.get('delta_auroc', 'N/A')}")
+
+    # Promote competitive_status to top level
+    report["competitive_status"] = auroc_cmp.get("competitive_status", "N/A")
+
+    # ------------------------------------------------------------------
+    # Domain generalization (Step 5)
+    # ------------------------------------------------------------------
+    if "domain_generalization" not in report and ooh_result:
+        _in_auroc = indist["metrics"].get("auroc", float("nan"))
+        _ooh = ooh_result.get("out_of_hospital", ooh_result.get("metrics", {}))
+        _ood_auroc = _ooh.get("auroc", float("nan"))
+        domain_metrics = {
+            "in_dist_auroc": round(_in_auroc, 4),
+            "ood_auroc": round(_ood_auroc, 4),
+        }
+        assert "in_dist_auroc" in domain_metrics
+        assert "ood_auroc" in domain_metrics
+        print(f"[DEBUG] Domain metrics: {domain_metrics}")
+        report["domain_generalization"] = domain_metrics
+
+    # ------------------------------------------------------------------
+    # Assertions before saving (Step 1)
+    # ------------------------------------------------------------------
+    assert report is not None, "results dict is None"
+    assert isinstance(report, dict), "results must be dict"
+    for _k in ["baseline_results", "main_model"]:
+        if _k not in report:
+            raise RuntimeError(f"Missing key in results: {_k}")
+
     save_json(report, cfg["results_path"])
     print(f"[DEBUG] Saved results to {cfg['results_path']}")
     logger.info("=" * 60)
     logger.info("DONE. Results saved to %s", cfg["results_path"])
     logger.info("=" * 60)
+
+    # ------------------------------------------------------------------
+    # Fail-hard checks (Step 8)
+    # ------------------------------------------------------------------
+    if "auroc_comparison" not in report:
+        raise RuntimeError("AUROC comparison missing from results")
+    if "st_probe_auroc" not in report:
+        raise RuntimeError("s_t probe missing from results")
 
     # ------------------------------------------------------------------
     # Generate plots and tables
@@ -1819,6 +1899,25 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> None:
     # ------------------------------------------------------------------
     _print_final_summary(report, indist, ooh_result, ablation_results,
                          baseline_best_hparams)
+
+    # ------------------------------------------------------------------
+    # FINAL RESULTS summary (Step 7)
+    # ------------------------------------------------------------------
+    _best_name_cmp = auroc_cmp.get("best_baseline_name", "N/A")
+    _best_auroc_cmp = auroc_cmp.get("best_baseline_auroc", float("nan"))
+    _main_auroc_cmp = auroc_cmp.get("main_model_auroc", float("nan"))
+    _delta_cmp = auroc_cmp.get("delta_auroc", float("nan"))
+    _ood_auroc_cmp = report.get("domain_generalization", {}).get("ood_auroc", float("nan"))
+    _st_probe_cmp = report.get("st_probe_auroc", float("nan"))
+    print("\n===== FINAL RESULTS =====")
+    print(f"Best baseline: {_best_name_cmp} {_best_auroc_cmp}")
+    print(f"Main model: {_main_auroc_cmp}")
+    print(f"ΔAUROC: {_delta_cmp}")
+    print(f"OOD AUROC: {_ood_auroc_cmp}")
+    print(f"s_t probe: {_st_probe_cmp}")
+    print("========================")
+
+    return report
 
 
 def _print_final_summary(
