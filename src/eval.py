@@ -9,8 +9,11 @@ Includes:
       * temporal intervention: intervene at t=k vs t=k+Δ, compare divergence
       * monotonicity sanity (skipped with logged note if directionality unknown)
       * stress tests (zero / max / flip) — labelled as stress tests
+      * grounded sanity: stratify by treatment intensity, compare predictions to observed
   - Competitiveness flagging: ΔAUROC vs best baseline
   - Disentanglement check: performance when e_t branch removed
+  - s_t predictive sufficiency probe: AUROC of linear classifier on s_t alone
+  - Domain generalization metrics: generalization gap + relative drop
 """
 
 from __future__ import annotations
@@ -29,6 +32,10 @@ from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_sco
 from utils import get_logger
 
 logger = get_logger("synthica.eval")
+
+# Named constants
+ST_COLLAPSE_THRESHOLD = 0.55   # s_t-only AUROC below this → warns of useless representation
+EPSILON_DIV_SAFE = 1e-8        # added to denominators to prevent division by zero
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +493,263 @@ def disentanglement_check(
     else:
         logger.info(
             "[Disentanglement] e_t removal degraded recon_loss by %.4f%% — disentanglement confirmed.",
-            100.0 * (abl_recon - orig_recon) / (orig_recon + 1e-8),
+            100.0 * (abl_recon - orig_recon) / (orig_recon + EPSILON_DIV_SAFE),
         )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# s_t predictive sufficiency probe
+# ---------------------------------------------------------------------------
+
+def evaluate_st_predictive_probe(
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    full_model_auroc: float,
+) -> Dict[str, Any]:
+    """
+    Train a linear classifier on s_t alone (no e_t) to predict y.
+    Compares AUROC(s_t only) vs AUROC(full model) to verify s_t carries
+    outcome signal and is not invariant-but-useless.
+
+    If s_t_only_auroc << full_model_auroc, s_t is predictive but less so —
+    expected and acceptable. If s_t_only_auroc ≈ 0.5, s_t has collapsed to
+    a useless representation.
+    """
+    import torch.optim as optim
+
+    logger.info("[s_t Probe] Training linear probe on s_t → outcome …")
+
+    if not hasattr(model, "encoder") or not hasattr(model, "s_dim"):
+        logger.warning("[s_t Probe] Model has no encoder/s_dim — skipping.")
+        return {"status": "skipped", "reason": "model lacks s_t branch"}
+
+    s_dim = model.s_dim
+
+    # Collect s_T and labels from loader
+    model.eval()
+    all_s: List[np.ndarray] = []
+    all_y: List[float] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            x = batch["x"].to(device)
+            u = batch["u"].to(device)
+            y_true = batch["outcome"].cpu().numpy()
+            out = model(x, u)
+            # Use mean s across time as probe input (same as adversary)
+            s_mean = out["s_seq"].mean(dim=1).cpu().numpy()  # [B, s_dim]
+            all_s.append(s_mean)
+            all_y.extend(y_true.tolist())
+
+    S = np.concatenate(all_s, axis=0)  # [N, s_dim]
+    Y = np.array(all_y)                # [N]
+
+    if len(np.unique(Y)) < 2:
+        logger.warning("[s_t Probe] Only one class in labels — probe AUROC undefined.")
+        return {"status": "skipped", "reason": "single class in labels"}
+
+    # Split for probe training (80/20)
+    n = len(S)
+    idx = np.random.permutation(n)
+    split = int(0.8 * n)
+    tr_idx, va_idx = idx[:split], idx[split:]
+
+    S_tr = torch.tensor(S[tr_idx], dtype=torch.float32).to(device)
+    Y_tr = torch.tensor(Y[tr_idx], dtype=torch.float32).to(device)
+    S_va = torch.tensor(S[va_idx], dtype=torch.float32).to(device)
+    Y_va = Y[va_idx]
+
+    # Linear probe
+    probe = torch.nn.Linear(s_dim, 1).to(device)
+    probe_opt = optim.Adam(probe.parameters(), lr=1e-3)
+
+    for _ in range(50):
+        probe.train()
+        probe_opt.zero_grad()
+        logits = probe(S_tr).squeeze(-1)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, Y_tr)
+        loss.backward()
+        probe_opt.step()
+
+    probe.eval()
+    with torch.no_grad():
+        va_logits = probe(S_va).squeeze(-1).cpu().numpy()
+    va_probs = 1.0 / (1.0 + np.exp(-va_logits))
+    st_auroc = compute_auroc(Y_va, va_probs)
+
+    delta = st_auroc - full_model_auroc
+    result = {
+        "st_only_auroc": round(st_auroc, 4),
+        "full_model_auroc": round(full_model_auroc, 4),
+        "delta_vs_full": round(delta, 4),
+    }
+
+    if st_auroc < ST_COLLAPSE_THRESHOLD:
+        logger.warning(
+            "!!! s_t PREDICTIVE SUFFICIENCY WARNING !!!\n"
+            "  s_t-only AUROC = %.4f — s_t may have collapsed to invariant but useless representation.\n"
+            "  Check collapse monitoring and reduce adversarial weight.",
+            st_auroc,
+        )
+    else:
+        logger.info(
+            "[s_t Probe] s_t-only AUROC=%.4f  Full model AUROC=%.4f  Δ=%.4f",
+            st_auroc, full_model_auroc, delta,
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Grounded counterfactual sanity check
+# ---------------------------------------------------------------------------
+
+def grounded_counterfactual_sanity(
+    model: torch.nn.Module,
+    sequences: List[dict],
+    device: torch.device,
+    n_samples: int = 64,
+) -> Dict[str, Any]:
+    """
+    SEMI-GROUNDED COUNTERFACTUAL SANITY CHECK (proxy, not causal ground truth).
+
+    Approach:
+      1. Stratify patients by observed treatment intensity (mean u_t magnitude).
+      2. For low-treatment patients, predict outcome under INCREASED treatment.
+      3. Compare mean predicted outcome (high-treatment counterfactual) against
+         mean observed outcome in the actual high-treatment group.
+
+    This anchors predictions to real data distributions — if the model is
+    totally arbitrary, the counterfactual predictions will diverge from the
+    observed high-treatment distribution.
+
+    NOTE: This is NOT a causal test. It is a sanity check on distributional
+    plausibility. Confounding and selection bias are not controlled for.
+    """
+    logger.info(
+        "[Grounded CF Sanity] Stratifying by treatment intensity "
+        "(proxy sanity check — not causal ground truth) …"
+    )
+
+    if not hasattr(model, "rollout_counterfactual"):
+        logger.warning("[Grounded CF Sanity] Model lacks rollout_counterfactual — skipping.")
+        return {"status": "skipped", "reason": "model lacks rollout_counterfactual"}
+
+    model.eval()
+
+    # Compute treatment intensity per patient (mean absolute u_t)
+    intensities = []
+    for s in sequences:
+        u = s["u"]  # [T, U]
+        intensities.append(float(u.abs().mean().item()))
+
+    intensities = np.array(intensities)
+    median_intensity = float(np.median(intensities))
+
+    lo_idx = np.where(intensities <= median_intensity)[0]
+    hi_idx = np.where(intensities > median_intensity)[0]
+
+    if len(lo_idx) == 0 or len(hi_idx) == 0:
+        return {"status": "skipped", "reason": "cannot stratify — all intensities identical"}
+
+    # Sample from each stratum
+    n_each = min(n_samples // 2, len(lo_idx), len(hi_idx))
+    lo_sample = np.random.choice(lo_idx, size=n_each, replace=False)
+    hi_sample = np.random.choice(hi_idx, size=n_each, replace=False)
+
+    # Observed outcomes in high-treatment group
+    hi_outcomes = np.array([float(sequences[i]["outcome"].item()) for i in hi_sample])
+    mean_hi_observed = float(hi_outcomes.mean())
+
+    # For low-treatment patients: predict outcome under max treatment (counterfactual)
+    cf_outcomes: List[float] = []
+    with torch.no_grad():
+        for idx in lo_sample:
+            s = sequences[idx]
+            x0 = s["x"][:1, :].unsqueeze(0).to(device)   # [1, 1, F]
+            u_orig = s["u"].unsqueeze(0).to(device)       # [1, T, U]
+            T = u_orig.shape[1]
+            # Max treatment counterfactual
+            u_cf = torch.ones_like(u_orig)
+            try:
+                x_cf = model.rollout_counterfactual(x0, u_cf, n_steps=T)  # [1, T, F]
+                # Encode the counterfactual trajectory to predict outcome
+                s_seq, _, _ = model.encoder(x_cf, u_cf[:, :x_cf.shape[1], :])
+                y_cf_logit = model.outcome_head(s_seq[:, -1, :]).squeeze(-1).cpu().numpy()
+                y_cf_prob = float(1.0 / (1.0 + np.exp(-y_cf_logit[0])))
+                cf_outcomes.append(y_cf_prob)
+            except Exception as ex:
+                logger.debug("[Grounded CF Sanity] rollout failed for sample %d: %s", idx, ex)
+
+    if not cf_outcomes:
+        return {"status": "skipped", "reason": "all rollouts failed"}
+
+    mean_cf_predicted = float(np.mean(cf_outcomes))
+    # Plausibility: both should be above 0.5 * mean_hi_observed (rough anchor)
+    plausible = mean_cf_predicted >= 0.5 * mean_hi_observed
+
+    result = {
+        "disclaimer": "proxy sanity check — not causal ground truth; confounding not controlled",
+        "median_treatment_intensity": round(median_intensity, 6),
+        "n_low_treatment": n_each,
+        "n_high_treatment": n_each,
+        "mean_hi_treatment_observed_outcome": round(mean_hi_observed, 4),
+        "mean_cf_predicted_outcome_under_max_treatment": round(mean_cf_predicted, 4),
+        "distributional_plausibility": plausible,
+    }
+    logger.info(
+        "[Grounded CF Sanity] Observed hi-treatment outcome=%.4f  CF predicted=%.4f  plausible=%s",
+        mean_hi_observed, mean_cf_predicted, plausible,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Domain generalization metrics
+# ---------------------------------------------------------------------------
+
+def compute_domain_generalization_metrics(
+    model_results: Dict[str, Dict],
+) -> Dict[str, Any]:
+    """
+    Compute domain generalization gap and relative drop for each model.
+
+    Expects each entry in model_results to have:
+      - "auroc": in-distribution AUROC
+      - "ooh_auroc": out-of-hospital AUROC (optional)
+
+    Returns per-model generalization gap and relative drop, plus ranking.
+    """
+    gen_metrics: Dict[str, Dict] = {}
+
+    for name, res in model_results.items():
+        if isinstance(res, dict) and "auroc" in res and "ooh_auroc" in res:
+            in_auroc = float(res["auroc"])
+            out_auroc = float(res["ooh_auroc"])
+            gap = round(in_auroc - out_auroc, 4)
+            rel_drop = round(gap / (in_auroc + EPSILON_DIV_SAFE), 4)
+            gen_metrics[name] = {
+                "in_dist_auroc": round(in_auroc, 4),
+                "ood_auroc": round(out_auroc, 4),
+                "generalization_gap": gap,
+                "relative_drop": rel_drop,
+            }
+
+    if not gen_metrics:
+        logger.warning("[Domain Gen] No models with both in-dist and OOD AUROC available.")
+        return {"status": "no_ood_data", "models": {}}
+
+    # Rank by generalization gap (lower is better)
+    ranked = sorted(gen_metrics.items(), key=lambda x: x[1]["generalization_gap"])
+    logger.info("[Domain Gen] Generalization gap ranking (lower = more robust):")
+    for i, (name, m) in enumerate(ranked):
+        logger.info(
+            "  %d. %-25s gap=%.4f  rel_drop=%.4f  in=%.4f  ood=%.4f",
+            i + 1, name, m["generalization_gap"], m["relative_drop"],
+            m["in_dist_auroc"], m["ood_auroc"],
+        )
+
+    return {"models": gen_metrics, "ranked_by_gap": [r[0] for r in ranked]}

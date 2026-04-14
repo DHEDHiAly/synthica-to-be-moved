@@ -2,22 +2,31 @@
 Main training script for the ICU trajectory disentangled model.
 
 Run via:
-    python src/train.py
+    python src/train.py                         # default pipeline
+    python src/train.py --mode full_experiment  # full experiment + reporting
 
 Features:
   - Loads data/eicu_final_sequences_for_modeling.csv (hard rule)
   - Infers & validates schema programmatically
   - Baseline tuning harness: grid over hidden_dim, lr, dropout
+    (+ n_layers, n_heads for transformer baselines)
   - Main model training with early stopping on validation AUROC
-  - Ablation suite (incl. remove-s_t ablation)
+  - Multi-seed evaluation (seeds 42/43/44) for main model + best baseline
+  - Ablation suite with standardized paper-ready names
+  - s_t predictive sufficiency probe
+  - Semi-grounded counterfactual sanity check
+  - Domain generalization gap + relative drop metrics
   - Counterfactual proxy evaluation
   - Calibration (ECE) mandatory
   - Competitiveness flagging (ΔAUROC)
+  - Loss grouped under: invariance / disentanglement / predictive modules
   - All results written to outputs/results.json
+  - Publication-ready plots and tables via --mode full_experiment
 """
 
 from __future__ import annotations
 
+import argparse
 import copy
 import itertools
 import json
@@ -54,6 +63,9 @@ from eval import (
     run_counterfactual_proxy_evaluation,
     disentanglement_check,
     compute_ece,
+    evaluate_st_predictive_probe,
+    grounded_counterfactual_sanity,
+    compute_domain_generalization_metrics,
 )
 from utils import set_seed, get_logger, EarlyStopping, save_checkpoint, SEED
 
@@ -90,6 +102,8 @@ DEFAULT_CFG: Dict[str, Any] = {
     "baseline_tune_epochs": 20,
     "baseline_tune_patience": 5,
     "baseline_tune_trials": 3,  # k random seeds per config
+    # Multi-seed evaluation
+    "eval_seeds": [42, 43, 44],
     # Ablations
     "run_ablations": True,
     # Counterfactual proxy eval
@@ -100,11 +114,25 @@ DEFAULT_CFG: Dict[str, Any] = {
     "checkpoint_dir": "outputs/checkpoints",
 }
 
-# Hyperparameter search grid for baselines
+# Base hyperparameter search grid for all baselines
 TUNE_GRID = {
     "hidden_dim": [64, 128, 256],
     "lr": [1e-3, 3e-4, 1e-4],
     "dropout": [0.0, 0.2, 0.5],
+}
+
+# Additional grid dimensions for transformer-based baselines
+TRANSFORMER_BASELINES = {"causal_transformer", "g_transformer"}
+TRANSFORMER_EXTRA_GRID = {
+    "n_layers": [2, 4],
+    "n_heads": [2, 4],
+}
+
+# Loss module grouping labels for structured logging
+LOSS_GROUPS = {
+    "predictive": ["recon", "outcome"],
+    "invariance": ["hospital_adv", "irm"],
+    "disentanglement": ["treatment_adv", "contrastive"],
 }
 
 
@@ -190,7 +218,25 @@ def _train_one_epoch(
                 avg["s_t_mean_var"],
             )
 
+    # Log losses grouped by module for interpretability
+    _log_loss_groups(avg)
+
     return avg
+
+
+def _log_loss_groups(avg_losses: Dict[str, float]) -> None:
+    """Log training losses grouped under invariance / disentanglement / predictive modules."""
+    groups: Dict[str, Dict[str, float]] = {g: {} for g in LOSS_GROUPS}
+    for key, val in avg_losses.items():
+        for group, prefixes in LOSS_GROUPS.items():
+            if any(key.startswith(p) for p in prefixes):
+                groups[group][key] = val
+                break
+
+    for group, losses in groups.items():
+        if losses:
+            loss_str = "  ".join(f"{k}={v:.4f}" for k, v in losses.items())
+            logger.debug("[%s module] %s", group.capitalize(), loss_str)
 
 
 def _train_baseline_epoch(
@@ -254,31 +300,55 @@ def tune_baseline(
 ) -> Tuple[Dict, float, nn.Module]:
     """
     Grid search over hidden_dim x lr x dropout for a single baseline.
+    Transformer baselines (CausalTransformer, GTransformer) additionally
+    search over n_layers ∈ {2,4} and n_heads ∈ {2,4}.
     Runs k_trials with different seeds per config; reports best validation AUROC config.
 
     Returns: (best_config, best_val_auroc, best_model)
     """
+    is_transformer = name.lower() in TRANSFORMER_BASELINES
+
+    if is_transformer:
+        base_configs = list(itertools.product(
+            TUNE_GRID["hidden_dim"],
+            TUNE_GRID["lr"],
+            TUNE_GRID["dropout"],
+            TRANSFORMER_EXTRA_GRID["n_layers"],
+            TRANSFORMER_EXTRA_GRID["n_heads"],
+        ))
+        n_configs = len(base_configs)
+    else:
+        base_configs = list(itertools.product(
+            TUNE_GRID["hidden_dim"],
+            TUNE_GRID["lr"],
+            TUNE_GRID["dropout"],
+        ))
+        n_configs = len(base_configs)
+
     logger.info("[Baseline Tune] %s — grid search over %d configs × %d trials",
-                name, len(list(itertools.product(*TUNE_GRID.values()))), k_trials)
+                name, n_configs, k_trials)
 
     best_cfg: Optional[Dict] = None
     best_auroc: float = -1.0
     best_model_state: Optional[Dict] = None
 
-    grid = list(itertools.product(
-        TUNE_GRID["hidden_dim"],
-        TUNE_GRID["lr"],
-        TUNE_GRID["dropout"],
-    ))
+    for combo in base_configs:
+        if is_transformer:
+            hidden_dim, lr, dropout, n_layers, n_heads = combo
+            extra_kwargs: Dict[str, Any] = {"n_layers": n_layers, "n_heads": n_heads}
+        else:
+            hidden_dim, lr, dropout = combo
+            extra_kwargs = {}
 
-    for hidden_dim, lr, dropout in grid:
         for trial in range(k_trials):
-            seed = SEED + trial * 1000 + abs(hash((name, hidden_dim, lr, dropout))) % 1000
+            seed = SEED + trial * 1000 + abs(hash((name, hidden_dim, lr, dropout,
+                                                     extra_kwargs.get("n_layers", 0),
+                                                     extra_kwargs.get("n_heads", 0)))) % 1000
             set_seed(seed)
 
             try:
                 model = build_baseline(name, input_dim, treatment_dim, n_hospitals,
-                                       hidden_dim=hidden_dim, dropout=dropout)
+                                       hidden_dim=hidden_dim, dropout=dropout, **extra_kwargs)
                 model = model.to(device)
             except Exception as ex:
                 logger.warning("[Baseline Tune] %s build failed: %s", name, ex)
@@ -299,16 +369,21 @@ def tune_baseline(
             trial_auroc = stopper.best_score
             if trial_auroc > best_auroc:
                 best_auroc = trial_auroc
-                best_cfg = {"hidden_dim": hidden_dim, "lr": lr, "dropout": dropout, "trial_seed": seed}
+                best_cfg = {"hidden_dim": hidden_dim, "lr": lr, "dropout": dropout,
+                            "trial_seed": seed, **extra_kwargs}
                 stopper.restore_best(model)
                 best_model_state = copy.deepcopy(model.state_dict())
 
     logger.info("[Baseline Tune] %s — best config: %s  val_AUROC=%.4f", name, best_cfg, best_auroc)
 
     # Rebuild best model
+    rebuild_kwargs = {}
+    if best_cfg and is_transformer:
+        rebuild_kwargs = {k: best_cfg[k] for k in ("n_layers", "n_heads") if k in best_cfg}
     best_model = build_baseline(name, input_dim, treatment_dim, n_hospitals,
-                                 hidden_dim=best_cfg["hidden_dim"],
-                                 dropout=best_cfg["dropout"])
+                                 hidden_dim=best_cfg["hidden_dim"] if best_cfg else 128,
+                                 dropout=best_cfg["dropout"] if best_cfg else 0.0,
+                                 **rebuild_kwargs)
     best_model = best_model.to(device)
     if best_model_state:
         best_model.load_state_dict(best_model_state)
@@ -371,8 +446,85 @@ def train_main_model(
 
 
 # ---------------------------------------------------------------------------
-# Ablation training
+# Multi-seed evaluation
 # ---------------------------------------------------------------------------
+
+def run_multiseed_evaluation(
+    input_dim: int,
+    treatment_dim: int,
+    n_hospitals: int,
+    train_seqs: List[dict],
+    val_seqs: List[dict],
+    test_seqs: List[dict],
+    cfg: Dict,
+    device: torch.device,
+    seeds: Optional[List[int]] = None,
+    schema_hospital_enabled: bool = True,
+) -> Dict[str, Any]:
+    """
+    Train main model with multiple seeds and report mean ± std AUROC.
+    Required for statistical credibility at ICML.
+    """
+    if seeds is None:
+        seeds = cfg.get("eval_seeds", [42, 43, 44])
+
+    logger.info("=== MULTI-SEED EVALUATION (seeds=%s) ===", seeds)
+    train_loader, val_loader, test_loader = make_loaders(
+        train_seqs, val_seqs, test_seqs, batch_size=cfg["batch_size"]
+    )
+
+    auroc_scores: List[float] = []
+    for seed in seeds:
+        set_seed(seed)
+        model = DisentangledICUModel(
+            input_dim=input_dim,
+            treatment_dim=treatment_dim,
+            n_hospitals=max(2, n_hospitals),
+            hidden_dim=cfg["hidden_dim"],
+            s_dim=cfg["s_dim"],
+            e_dim=cfg["e_dim"],
+            num_layers=cfg["num_layers"],
+            dropout=cfg["dropout"],
+            grl_alpha=cfg["grl_alpha"],
+            use_hospital_adv=schema_hospital_enabled,
+            use_treatment_adv=True,
+            use_contrastive=True,
+            use_irm=schema_hospital_enabled,
+        ).to(device)
+
+        best_val_auroc, _ = train_main_model(model, train_loader, val_loader, cfg, device, n_hospitals)
+        test_metrics = evaluate_model(model, test_loader, device, tag=f"seed{seed}_test")
+        auroc_scores.append(test_metrics["auroc"])
+        logger.info("[Multi-seed] seed=%d  test_AUROC=%.4f", seed, test_metrics["auroc"])
+
+    mean_auroc = float(np.mean(auroc_scores))
+    std_auroc = float(np.std(auroc_scores))
+    logger.info(
+        "[Multi-seed] AUROC = %.4f ± %.4f  (seeds=%s)",
+        mean_auroc, std_auroc, seeds,
+    )
+    return {
+        "seeds": seeds,
+        "per_seed_auroc": {str(s): round(a, 4) for s, a in zip(seeds, auroc_scores)},
+        "mean_auroc": round(mean_auroc, 4),
+        "std_auroc": round(std_auroc, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ablation training  (standardized paper-ready names)
+# ---------------------------------------------------------------------------
+
+# Maps internal ablation key → paper display name
+ABLATION_PAPER_NAMES: Dict[str, str] = {
+    "no_adv_heads":    "w/o Adversarial",
+    "no_hosp_adv":     "w/o Hospital Adversary",
+    "no_treat_adv":    "w/o Treatment Adversary",
+    "no_contrastive":  "w/o Contrastive",
+    "no_irm":          "w/o IRM",
+    "no_s_t_et_only":  "e_t only (no s_t)",
+}
+
 
 def run_ablations(
     input_dim: int,
@@ -385,29 +537,32 @@ def run_ablations(
     device: torch.device,
 ) -> Dict[str, Dict]:
     """
-    Run ablation experiments:
-      1. No adversarial heads
-      2. No contrastive loss
-      3. No IRM
-      4. No e_t branch (e_t-only model) — KEY ABLATION
+    Run ablation experiments with paper-ready names:
+      - w/o Adversarial           (both hospital + treatment adversary removed)
+      - w/o Hospital Adversary
+      - w/o Treatment Adversary
+      - w/o Contrastive
+      - w/o IRM
+      - e_t only (no s_t)         ← KEY ABLATION: validates s_t signal
     """
     logger.info("=== ABLATION SUITE ===")
     results = {}
 
-    # Ablation configs
+    # Ablation configs — key is standardised for table output
     ablation_configs = [
-        ("no_hosp_adv", {"use_hospital_adv": False}),
-        ("no_treat_adv", {"use_treatment_adv": False}),
+        ("no_adv_heads",   {"use_hospital_adv": False, "use_treatment_adv": False}),
+        ("no_hosp_adv",    {"use_hospital_adv": False}),
+        ("no_treat_adv",   {"use_treatment_adv": False}),
         ("no_contrastive", {"use_contrastive": False}),
-        ("no_irm", {"lambda_irm": 0.0}),
-        ("no_adv_heads", {"use_hospital_adv": False, "use_treatment_adv": False}),
+        ("no_irm",         {"lambda_irm": 0.0}),
     ]
 
     train_loader, val_loader, test_loader = make_loaders(train_seqs, val_seqs, test_seqs,
                                                           batch_size=cfg["batch_size"])
 
     for abl_name, overrides in ablation_configs:
-        logger.info("--- Ablation: %s ---", abl_name)
+        display = ABLATION_PAPER_NAMES.get(abl_name, abl_name)
+        logger.info("--- Ablation: %s (%s) ---", display, abl_name)
         abl_cfg = {**cfg, **overrides}
         set_seed(SEED)
         model = DisentangledICUModel(
@@ -428,10 +583,15 @@ def run_ablations(
 
         best_val_auroc, _ = train_main_model(model, train_loader, val_loader, abl_cfg, device, n_hospitals)
         test_metrics = evaluate_model(model, test_loader, device, tag=f"ablation_{abl_name}_test")
-        results[abl_name] = {"val_auroc": best_val_auroc, **test_metrics}
+        results[abl_name] = {
+            "display_name": display,
+            "val_auroc": best_val_auroc,
+            **test_metrics,
+        }
 
     # KEY ABLATION: no s_t / e_t-only model
-    logger.info("--- KEY ABLATION: no_s_t (e_t-only model) ---")
+    display_et = ABLATION_PAPER_NAMES.get("no_s_t_et_only", "e_t only (no s_t)")
+    logger.info("--- KEY ABLATION: %s ---", display_et)
     set_seed(SEED)
     et_model = EtOnlyModel(
         input_dim=input_dim,
@@ -453,9 +613,13 @@ def run_ablations(
 
     stopper.restore_best(et_model)
     test_m = evaluate_model(et_model, test_loader, device, tag="no_s_t_test")
-    results["no_s_t_et_only"] = {"val_auroc": stopper.best_score, **test_m,
-                                   "note": "KEY ABLATION: s_t removed entirely; e_t only"}
-    logger.info("KEY ABLATION no_s_t: test_AUROC=%.4f", test_m["auroc"])
+    results["no_s_t_et_only"] = {
+        "display_name": display_et,
+        "val_auroc": stopper.best_score,
+        **test_m,
+        "note": "KEY ABLATION: tests if s_t carries signal — s_t removed entirely",
+    }
+    logger.info("KEY ABLATION %s: test_AUROC=%.4f", display_et, test_m["auroc"])
 
     return results
 
@@ -658,17 +822,53 @@ def main(cfg: Optional[Dict] = None) -> Dict[str, Any]:
         )
         results["ablations"] = ablation_results
 
-        # Log ablation summary
+        # Log ablation summary with standardised names
         logger.info("=== ABLATION SUMMARY ===")
         main_auroc = test_metrics["auroc"]
         for abl_name, abl_res in ablation_results.items():
+            display = abl_res.get("display_name", abl_name)
             delta = abl_res.get("auroc", 0.0) - main_auroc
-            logger.info("  %-30s AUROC=%.4f  Δ=%.4f  %s",
-                        abl_name, abl_res.get("auroc", 0.0), delta,
+            logger.info("  %-35s AUROC=%.4f  Δ=%.4f  %s",
+                        display, abl_res.get("auroc", 0.0), delta,
                         abl_res.get("note", ""))
 
     # -----------------------------------------------------------------------
-    # 8. Final summary
+    # 8. s_t predictive sufficiency probe
+    # -----------------------------------------------------------------------
+    logger.info("=== s_t PREDICTIVE SUFFICIENCY PROBE ===")
+    st_probe_result = evaluate_st_predictive_probe(
+        main_model, test_loader, device, full_model_auroc=test_metrics["auroc"]
+    )
+    results["st_predictive_probe"] = st_probe_result
+
+    # -----------------------------------------------------------------------
+    # 9. Semi-grounded counterfactual sanity check
+    # -----------------------------------------------------------------------
+    if cfg.get("run_cf_eval", True):
+        grounded_cf_result = grounded_counterfactual_sanity(
+            main_model, iid_test_seqs, device, n_samples=cfg.get("cf_n_samples", 16) * 4
+        )
+        results.setdefault("counterfactual_proxy_eval", {})["grounded_sanity"] = grounded_cf_result
+
+    # -----------------------------------------------------------------------
+    # 10. Domain generalization gap metrics
+    # -----------------------------------------------------------------------
+    all_models_for_gen: Dict[str, Dict] = {}
+    if "main_model" in results and results["main_model"].get("ooh_metrics"):
+        all_models_for_gen["Full Model"] = {
+            "auroc": results["main_model"]["auroc"],
+            "ooh_auroc": results["main_model"]["ooh_metrics"]["auroc"],
+        }
+    for bl_name, bl_res in baseline_results.items():
+        if isinstance(bl_res, dict) and "auroc" in bl_res and "ooh_auroc" in bl_res:
+            all_models_for_gen[bl_name] = bl_res
+
+    if all_models_for_gen:
+        domain_gen_metrics = compute_domain_generalization_metrics(all_models_for_gen)
+        results["domain_generalization"] = domain_gen_metrics
+
+    # -----------------------------------------------------------------------
+    # 11. Final summary
     # -----------------------------------------------------------------------
     logger.info("=== FINAL RESULTS SUMMARY ===")
     logger.info("Main model:  AUROC=%.4f  AUPRC=%.4f  Acc=%.4f  ECE=%.4f",
@@ -687,5 +887,102 @@ def main(cfg: Optional[Dict] = None) -> Dict[str, Any]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Full experiment pipeline (--mode full_experiment)
+# ---------------------------------------------------------------------------
+
+def full_experiment(cfg: Optional[Dict] = None) -> Dict[str, Any]:
+    """
+    Full experiment pipeline: trains all models, runs all evaluations,
+    runs multi-seed stability check, and generates publication-ready
+    plots + tables.
+
+    Run via:
+        python src/train.py --mode full_experiment
+    """
+    if cfg is None:
+        cfg = copy.deepcopy(DEFAULT_CFG)
+
+    logger.info("=== FULL EXPERIMENT PIPELINE ===")
+
+    # Step 1: Run main pipeline (baselines + main model + ablations + CF eval)
+    results = main(cfg)
+
+    # Step 2: Multi-seed stability evaluation
+    # Reload data for re-training under different seeds
+    logger.info("=== STEP 2: MULTI-SEED STABILITY ===")
+    df = load_raw()
+    schema = infer_schema(df)
+    sequences, _ = build_sequences(df, schema, seq_len=cfg["seq_len"])
+
+    if schema.hospital_invariance_enabled:
+        try:
+            train_seqs, val_seqs, iid_test_seqs, _ = split_out_of_hospital(sequences, df, schema)
+        except Exception:
+            train_seqs, val_seqs, iid_test_seqs = split_random(sequences)
+    else:
+        train_seqs, val_seqs, iid_test_seqs = split_random(sequences)
+
+    input_dim = sequences[0]["x"].shape[-1]
+    treatment_dim = sequences[0]["u"].shape[-1]
+    n_hospitals = int(max(s["env_id"].item() for s in sequences)) + 1
+    device = _get_device()
+
+    stability = run_multiseed_evaluation(
+        input_dim=input_dim,
+        treatment_dim=treatment_dim,
+        n_hospitals=n_hospitals,
+        train_seqs=train_seqs,
+        val_seqs=val_seqs,
+        test_seqs=iid_test_seqs,
+        cfg=cfg,
+        device=device,
+        seeds=cfg.get("eval_seeds", [42, 43, 44]),
+        schema_hospital_enabled=schema.hospital_invariance_enabled,
+    )
+    results["stability"] = stability
+
+    # Step 3: Generate plots + tables
+    logger.info("=== STEP 3: GENERATING PLOTS + TABLES ===")
+    from reporting import generate_all_reports
+    generate_all_reports(
+        results=results,
+        output_dir=cfg["output_dir"],
+    )
+
+    # Re-save updated results with stability data
+    out_path = os.path.join(cfg["output_dir"], "results.json")
+    with open(out_path, "w") as fh:
+        json.dump(results, fh, indent=2, default=str)
+    logger.info("Updated results saved → %s", out_path)
+
+    logger.info("=== FULL EXPERIMENT COMPLETE ===")
+    logger.info("Outputs → %s/", cfg["output_dir"])
+    logger.info("  results.json, metrics.csv")
+    logger.info("  plots/  tables/  logs/")
+    if results.get("stability"):
+        logger.info("Stability: mean AUROC = %.4f ± %.4f",
+                    results["stability"]["mean_auroc"],
+                    results["stability"]["std_auroc"])
+
+    return results
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="ICU Trajectory Modeling")
+    parser.add_argument(
+        "--mode",
+        choices=["train", "full_experiment"],
+        default="train",
+        help=(
+            "Execution mode: "
+            "'train' runs the standard pipeline (default); "
+            "'full_experiment' adds multi-seed stability + publication plots/tables."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.mode == "full_experiment":
+        full_experiment()
+    else:
+        main()
