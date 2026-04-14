@@ -1,0 +1,34 @@
+# Data files (download separately)
+data/eicu_final_sequences_for_modeling.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Outputs (checkpoints, logs, results)
+outputs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Egg info
+*.egg-info/
+dist/
+build/
