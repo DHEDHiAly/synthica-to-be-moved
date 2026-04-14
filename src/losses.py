@@ -224,21 +224,6 @@ def irm_penalty(
     return torch.stack(penalties).mean()
 
 
-class TotalLoss(nn.Module):
-    """Weighted sum of all training losses."""
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    """IRM v1 gradient penalty (Arjovsky et al., 2019).
-
-    Penalises the gradient of the risk w.r.t. a fixed scalar `scale`
-    (initialised to 1).  The gradient norm should be small at an invariant
-    predictor.
-    """
-    loss = F.binary_cross_entropy_with_logits(logits * scale, labels.float())
-    grad = torch.autograd.grad(loss, [scale], create_graph=True)[0]
-    return (grad ** 2).sum()
-
-
 # ---------------------------------------------------------------------------
 # Total Loss
 # ---------------------------------------------------------------------------
@@ -268,24 +253,6 @@ class TotalLoss(nn.Module):
         self.lambda_treatment_adv = lambda_treatment_adv
         self.lambda_contrastive = lambda_contrastive
         self.lambda_irm = lambda_irm
-
-        lambda_hosp_adv: float = 0.1,
-        lambda_trt_adv: float = 0.1,
-        lambda_contrastive: float = 0.05,
-        lambda_irm: float = 0.0,
-        pos_weight: Optional[torch.Tensor] = None,
-    ) -> None:
-        super().__init__()
-        self.lambda_outcome = lambda_outcome
-        self.lambda_hosp_adv = lambda_hosp_adv
-        self.lambda_trt_adv = lambda_trt_adv
-        self.lambda_contrastive = lambda_contrastive
-        self.lambda_irm = lambda_irm
-
-        self.recon_loss = ReconstructionLoss()
-        self.outcome_loss = OutcomeLoss(pos_weight=pos_weight)
-        self.adv_loss = AdversarialLoss()
-        self.contrastive_loss = ContrastiveLoss()
 
     def forward(
         self,
@@ -327,40 +294,3 @@ class TotalLoss(nn.Module):
 
         losses["total"] = total
         return total, losses
-        outcome_logits: torch.Tensor,
-        outcome_labels: torch.Tensor,
-        hosp_logits: torch.Tensor,
-        hosp_labels: torch.Tensor,
-        trt_logits: torch.Tensor,
-        trt_labels: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        z1: Optional[torch.Tensor] = None,
-        z2: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        l_recon = self.recon_loss(x_pred, x_true, mask)
-        l_outcome = self.outcome_loss(outcome_logits, outcome_labels)
-        l_hosp = self.adv_loss(hosp_logits, hosp_labels)
-        l_trt = self.adv_loss(trt_logits, trt_labels)
-
-        total = (
-            l_recon
-            + self.lambda_outcome * l_outcome
-            + self.lambda_hosp_adv * l_hosp
-            + self.lambda_trt_adv * l_trt
-        )
-
-        losses = {
-            "total": total,
-            "recon": l_recon,
-            "outcome": l_outcome,
-            "hosp_adv": l_hosp,
-            "trt_adv": l_trt,
-        }
-
-        if z1 is not None and z2 is not None and self.lambda_contrastive > 0:
-            l_contrast = self.contrastive_loss(z1, z2)
-            total = total + self.lambda_contrastive * l_contrast
-            losses["contrastive"] = l_contrast
-            losses["total"] = total
-
-        return losses

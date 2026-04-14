@@ -10,7 +10,6 @@ import os
 SEED = 42
 
 
-def set_seed(seed: int = SEED) -> None:
 """
 utils.py — Utilities: logging, seeding, GradientReversalLayer, checkpoint I/O, metric helpers.
 """
