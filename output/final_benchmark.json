@@ -1,0 +1,22 @@
+{
+  "results": {
+    "XGBoost (mean)": {
+      "auc": 0.502472994379827,
+      "ap": 0.05886577414282112
+    },
+    "XGBoost (last)": {
+      "auc": 0.5025254906207436,
+      "ap": 0.058140798057597205
+    },
+    "Random Forest": {
+      "auc": 0.5019122251821488,
+      "ap": 0.0582068561817211
+    }
+  },
+  "features": [
+    "heartrate",
+    "systemicsystolic",
+    "sao2",
+    "norepi_rate"
+  ]
+}

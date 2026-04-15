@@ -1,0 +1,28 @@
+{
+  "feature_hash": "768c08084f201a37",
+  "n_features": 7,
+  "n_train_seqs": 160187,
+  "n_test_seqs": 40047,
+  "results": {
+    "xgb_mean": {
+      "auc": 1.0,
+      "ap": 1.0,
+      "acc": 1.0
+    },
+    "xgb_last": {
+      "auc": 1.0,
+      "ap": 1.0,
+      "acc": 1.0
+    },
+    "rf_mean": {
+      "auc": 1.0,
+      "ap": 1.0,
+      "acc": 1.0
+    },
+    "logreg_mean": {
+      "auc": 1.0,
+      "ap": 1.0,
+      "acc": 1.0
+    }
+  }
+}

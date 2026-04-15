@@ -1,0 +1,29 @@
+patientunitstayid
+time_bin
+heartrate
+systemicsystolic
+sao2
+cardiovascular|intravenous fluid|normal saline administration
+cardiovascular|myocardial ischemia / infarction|antiplatelet agent|aspirin
+cardiovascular|vascular disorders|VTE prophylaxis|compression boots
+cardiovascular|vascular disorders|VTE prophylaxis|compression stockings
+endocrine|glucose metabolism|insulin|sliding scale administration
+gastrointestinal|medications|antiemetic|serotonin antagonist|ondansetron
+gastrointestinal|medications|stress ulcer prophylaxis|pantoprazole
+infectious diseases|cultures / immuno-assays|cultures|blood
+infectious diseases|medications|therapeutic antibacterials|penicillins|piperacillin/tazobactam
+infectious diseases|medications|therapeutic antibacterials|vancomycin
+neurologic|pain / agitation / altered mentation|analgesics|bolus parenteral analgesics
+neurologic|pain / agitation / altered mentation|analgesics|narcotic analgesic
+pulmonary|medications|bronchodilator|nebulized
+pulmonary|radiologic procedures / bronchoscopy|chest x-ray
+pulmonary|ventilation and oxygenation|CPAP/PEEP therapy
+pulmonary|ventilation and oxygenation|mechanical ventilation
+pulmonary|ventilation and oxygenation|oxygen therapy (40% to 60%)
+pulmonary|ventilation and oxygenation|oxygen therapy (< 40%)|nasal cannula
+renal|intravenous fluid|normal saline administration
+renal|urinary catheters|foley catheter
+norepi_rate
+hospitalid
+mortality
+los_days
