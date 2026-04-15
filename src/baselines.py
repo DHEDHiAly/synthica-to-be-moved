@@ -738,7 +738,50 @@ BASELINE_REGISTRY: dict[str, type] = {
     "erm": ERM,
     "dann": DANN,
     "domain_confusion": DomainConfusion,
-}
+    G-Transformer: Transformer variant of G-computation for counterfactual
+    inference (Li et al., 2021 — simplified Transformer adaptation).
+    """
+
+    def __init__(
+        self,
+        x_dim: int,
+        u_dim: int,
+        hidden_dim: int = 128,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.feat_proj = nn.Linear(x_dim, hidden_dim)
+        self.trt_proj = nn.Linear(u_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            hidden_dim, nhead, dim_feedforward=hidden_dim * 2,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.out_head = nn.Linear(hidden_dim, x_dim)
+        self.outcome_head = _mlp(hidden_dim, hidden_dim // 2, 1, n_layers=2)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        B, T, _ = x.shape
+        h = self.feat_proj(x) + self.trt_proj(u)
+        # Build causal mask
+        causal = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        # key_padding_mask: True = ignore
+        kp_mask = ~mask if mask is not None else None
+        h = self.transformer(h, mask=causal, src_key_padding_mask=kp_mask)
+        x_pred = self.out_head(h)
+        h_final = _get_final_hidden(h, mask)
+        outcome_logit = self.outcome_head(h_final).squeeze(-1)
+        return {"x_pred": x_pred, "outcome_logit": outcome_logit}
+
+    def get_outcome_logit(self, x, u, mask=None):
+        return self.forward(x, u, mask)["outcome_logit"]
 
 
 # ---------------------------------------------------------------------------

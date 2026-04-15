@@ -49,7 +49,6 @@ import copy
 import itertools
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -60,11 +59,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
-print("[DEBUG] CWD:", os.getcwd())
-
-# Absolute base directory for repo-relative output paths
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Add src/ to path when running from repo root
 sys.path.insert(0, os.path.dirname(__file__))
@@ -147,74 +141,41 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CFG: Dict[str, Any] = {
     # Data
-    "data_path": os.path.join(_BASE_DIR, "data", "eicu_final_sequences_for_modeling.csv"),
     "seq_len": 24,
-    "max_seq_len": 48,
-    "min_seq_len": 3,
     "batch_size": 64,
-    "split_mode": "out_of_hospital",
-    "seed": 42,
     # Model
     "hidden_dim": 128,
     "s_dim": 64,
-    "e_dim": 32,
+    "e_dim": 64,
     "num_layers": 2,
-    "enc_layers": 2,
-    "enc_dropout": 0.1,
     "dropout": 0.1,
     "grl_alpha": 1.0,
-    "grl_anneal": True,
-    "grl_alpha_max": 1.0,
-    "num_trt_classes": 2,
-    "proj_dim": 64,
     # Training
     "lr": 3e-4,
     "weight_decay": 1e-4,
     "max_epochs": 50,
     "patience": 10,
-    "grad_clip": 1.0,
     # Losses
     "lambda_outcome": 1.0,
     "lambda_hospital_adv": 0.1,
-    "lambda_hosp_adv": 0.1,
     "lambda_treatment_adv": 0.1,
-    "lambda_trt_adv": 0.1,
     "lambda_contrastive": 0.05,
     "lambda_irm": 0.01,
-    "disc_lr_multiplier": 2.0,
-    "contrastive_noise_scale": 0.05,
     # Baseline tuning
     "run_baseline_tuning": True,
-    "run_baselines": True,
     "baseline_tune_epochs": 20,
-    "baseline_epochs": 30,
     "baseline_tune_patience": 5,
-    "baseline_patience": 10,
-    "baseline_hparam_search": False,
-    "baseline_tune_trials": 3,
-    "baseline_hidden_dim": 128,
-    "baseline_lr": 3e-4,
-    "baseline_hparam_hidden_dims": [64, 128, 256],
-    "baseline_hparam_lrs": [1e-3, 3e-4, 1e-4],
-    "baselines_to_run": [
-        "erm", "dann", "domain_confusion", "irm",
-        "crn", "gnet", "rmsn", "dcrn",
-        "causal_transformer", "g_transformer", "mamba_cdsp",
-    ],
+    "baseline_tune_trials": 3,  # k random seeds per config
     # Multi-seed evaluation
     "eval_seeds": [42, 43, 44],
     # Ablations
     "run_ablations": True,
-    "ablation_epochs": 20,
-    "monitor_disentanglement_interval": 10,
     # Counterfactual proxy eval
     "run_cf_eval": True,
     "cf_n_samples": 16,
-    # Outputs (absolute paths)
-    "output_dir": os.path.join(_BASE_DIR, "outputs"),
-    "checkpoint_dir": os.path.join(_BASE_DIR, "outputs", "checkpoints"),
-    "log_file": os.path.join(_BASE_DIR, "outputs", "train.log"),
-    "results_path": os.path.join(_BASE_DIR, "outputs", "results.json"),
+    # Outputs
+    "output_dir": "outputs",
+    "checkpoint_dir": "outputs/checkpoints",
 }
 
 # Base hyperparameter search grid for all baselines
@@ -260,68 +221,67 @@ def _train_one_epoch(
     model.train()
     total_losses: Dict[str, List[float]] = {}
     collapse_stats: List[Dict] = []
-
-    for batch in loader:
-        x = batch["x"].to(device)
-        u = batch["u"].to(device)
-        y_true = batch["outcome"].to(device)
-        env_ids = batch["env_id"].to(device)
-
-        optimizer.zero_grad()
-        out = model(x, u, env_ids=env_ids)
-
-        hosp_logits = out.get("hosp_logits")
-        treat_logits = out.get("treat_logits")
-        s_proj = out.get("s_proj")
-
-        if treat_logits is not None:
-            treat_labels = u.mean(dim=1).argmax(dim=-1).clamp(0, treat_logits.shape[-1] - 1)
-        else:
-            treat_labels = None
-
-        total, losses = loss_fn(
-            x_pred=out["x_pred"],
-            x_true=out["x_true"],
-            y_pred=out["y_pred"],
-            y_true=y_true,
-            hosp_logits=hosp_logits,
-            hosp_labels=env_ids if hosp_logits is not None else None,
-            treat_logits=treat_logits,
-            treat_labels=treat_labels,
-            s_i=s_proj,
-            s_j=s_proj.roll(1, 0) if s_proj is not None else None,
-            irm_logits=out["y_pred"] if cfg.get("lambda_irm", 0) > 0 else None,
-            irm_labels=y_true if cfg.get("lambda_irm", 0) > 0 else None,
-            irm_env_ids=env_ids if cfg.get("lambda_irm", 0) > 0 else None,
-        )
-
-        total.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.get("grad_clip", 1.0))
-        optimizer.step()
-
-        for k, v in losses.items():
-            total_losses.setdefault(k, []).append(v.item() if isinstance(v, torch.Tensor) else v)
-
-        if monitor_collapse and hasattr(model, "monitor_collapse"):
-            with torch.no_grad():
-                s_seq = out.get("s_seq")
-                if s_seq is not None:
-                    stats = model.monitor_collapse(s_seq.detach())
-                    collapse_stats.append(stats)
-
-    avg = {k: float(np.mean(v)) for k, v in total_losses.items()}
-
-    if collapse_stats:
-        avg["s_t_mean_var"] = float(np.mean([s["s_t_mean_var"] for s in collapse_stats]))
-        avg["s_t_min_var"] = float(np.mean([s["s_t_min_var"] for s in collapse_stats]))
-        if avg["s_t_mean_var"] < 0.01:
-            logger.warning(
-                "!!! COLLAPSE WARNING: s_t mean variance = %.6f !!!",
-                avg["s_t_mean_var"],
-            )
-
-    _log_loss_groups(avg)
-    return avg
+    "data_path": "data/eicu_final_sequences_for_modeling.csv",
+    "max_seq_len": 48,
+    "min_seq_len": 3,
+    "batch_size": 64,
+    "split_mode": "out_of_hospital",  # "random" | "out_of_hospital"
+    "seed": 42,
+    # Model
+    "s_dim": 64,
+    "e_dim": 32,
+    "hidden_dim": 128,
+    "enc_layers": 2,
+    "enc_dropout": 0.1,
+    "num_trt_classes": 2,
+    "proj_dim": 64,
+    "grl_alpha": 1.0,
+    # Training
+    "lr": 3e-4,
+    "weight_decay": 1e-5,
+    "max_epochs": 100,
+    "patience": 15,
+    "grad_clip": 1.0,
+    # Loss weights
+    "lambda_outcome": 1.0,
+    "lambda_hosp_adv": 0.1,
+    "lambda_trt_adv": 0.1,
+    "lambda_contrastive": 0.05,
+    "lambda_irm": 0.0,
+    # Discriminator
+    "disc_lr_multiplier": 2.0,
+    # Contrastive augmentation
+    "contrastive_noise_scale": 0.05,
+    # GRL alpha schedule
+    "grl_anneal": True,
+    "grl_alpha_max": 1.0,
+    # Baselines — hyperparameter search
+    # Set baseline_hparam_search=True to run a 3×3 grid (hidden_dim × lr).
+    # When False, uses the single values in baseline_hidden_dim / baseline_lr.
+    "run_baselines": True,
+    "baseline_epochs": 30,
+    "baseline_patience": 10,
+    "baseline_hparam_search": False,
+    "baseline_hidden_dim": 128,
+    "baseline_lr": 3e-4,
+    "baseline_hparam_hidden_dims": [64, 128, 256],
+    "baseline_hparam_lrs": [1e-3, 3e-4, 1e-4],
+    "baselines_to_run": [
+        "erm", "dann", "domain_confusion", "irm",
+        "crn", "gnet", "rmsn", "dcrn",
+        "causal_transformer", "g_transformer", "mamba_cdsp",
+    ],
+    # Ablations
+    "run_ablations": True,
+    "ablation_epochs": 20,
+    # Disentanglement monitoring (run every N epochs; 0 = only at end)
+    "monitor_disentanglement_interval": 10,
+    # Output
+    "output_dir": "outputs",
+    "checkpoint_dir": "outputs/checkpoints",
+    "log_file": "outputs/train.log",
+    "results_path": "outputs/results.json",
+}
 
 # ---------------------------------------------------------------------------
 # Paper-ready ablation name mapping
@@ -424,9 +384,6 @@ def train_epoch(
 ) -> Dict[str, float]:
     model.train()
     total_stats: Dict[str, float] = {}
-    total_losses: Dict[str, List[float]] = {}
-    collapse_stats: List[Dict] = []
-    monitor_collapse = True
     n_batches = 0
 
     for batch in loader:
@@ -891,7 +848,90 @@ def run_ablations(
         "note": "KEY ABLATION: tests if s_t carries signal — s_t removed entirely",
     }
     logger.info("KEY ABLATION %s: test_AUROC=%.4f", display_et, test_m["auroc"])
-    return results
+        mask = batch["mask"].to(device)
+        y = batch["y"].to(device)
+        hospital_id = batch["hospital_id"].to(device)
+
+        # -------- Discriminator step --------
+        disc_stats = update_discriminators(
+            model, batch, disc_optim, adv_loss_fn, device,
+            cfg.get("num_trt_classes", 2),
+        )
+
+        # -------- Encoder + model step --------
+        optimizer.zero_grad()
+        out = model(x, u, mask)
+
+        # Build adversarial labels for the encoder update
+        B, T, _ = x.shape
+        if mask is not None:
+            valid = mask.view(-1)
+            h_flat = hospital_id.unsqueeze(1).expand(B, T).reshape(B * T)[valid]
+            u_flat = u.view(B * T, -1)[valid]
+        else:
+            h_flat = hospital_id.unsqueeze(1).expand(B, T).reshape(B * T)
+            u_flat = u.view(B * T, -1)
+        trt_label = (u_flat.sum(dim=-1) > 0).long()
+
+        # Contrastive: use two augmented views of s (noise-based augmentation)
+        s = out["s"]                           # (B, T, s_dim)
+        s_avg = s.mean(dim=1)                  # (B, s_dim) — summary over time
+        # Simple augmentation: add Gaussian noise
+        noise_scale = cfg.get("contrastive_noise_scale", 0.05)
+        z1 = model.contrastive_head(
+            s_avg + torch.randn_like(s_avg) * noise_scale
+        )
+        z2 = model.contrastive_head(
+            s_avg + torch.randn_like(s_avg) * noise_scale
+        )
+
+        losses = loss_fn(
+            x_pred=out["x_pred"],
+            x_true=x,
+            outcome_logits=out["outcome_logit"],
+            outcome_labels=y,
+            hosp_logits=out["hosp_logits"],
+            hosp_labels=h_flat,
+            trt_logits=out["trt_logits"],
+            trt_labels=trt_label,
+            mask=mask,
+            z1=z1,
+            z2=z2,
+        )
+
+        total_loss = losses["total"]
+
+        # Optional IRM penalty (applied across hospital environments)
+        if cfg.get("lambda_irm", 0.0) > 0:
+            irm_losses = []
+            for hid in hospital_id.unique():
+                h_mask = hospital_id == hid
+                if h_mask.sum() < 2:
+                    continue
+                scale = torch.ones(1, device=device, requires_grad=True)
+                pen = irm_penalty(
+                    out["outcome_logit"][h_mask] * scale,
+                    y[h_mask],
+                    scale,
+                )
+                irm_losses.append(pen)
+            if irm_losses:
+                total_loss = total_loss + cfg["lambda_irm"] * torch.stack(irm_losses).mean()
+
+        total_loss.backward()
+        if cfg.get("grad_clip", 0) > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+        optimizer.step()
+
+        # Accumulate stats
+        for k, v in losses.items():
+            if isinstance(v, torch.Tensor):
+                total_stats[k] = total_stats.get(k, 0.0) + v.item()
+        for k, v in disc_stats.items():
+            total_stats[k] = total_stats.get(k, 0.0) + v
+        n_batches += 1
+
+    return {k: v / max(n_batches, 1) for k, v in total_stats.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -1624,7 +1664,7 @@ if __name__ == "__main__":
         full_experiment()
     else:
         main()
-def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def main(cfg: Optional[Dict[str, Any]] = None) -> None:
     if cfg is None:
         cfg = DEFAULT_CFG.copy()
 
@@ -1697,8 +1737,6 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # Evaluate main model (in-distribution)
     indist = evaluate_in_distribution(main_model, test_loader, device)
     logger.info("Main model in-dist metrics: %s", indist["metrics"])
-    print("[DEBUG] Main model metrics:", indist["metrics"])
-    assert "auroc" in indist["metrics"], "Main model missing AUROC"
 
     # Evaluate main model (out-of-hospital)
     ooh_result = None
@@ -1734,7 +1772,6 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         )
         for bl_name in cfg.get("baselines_to_run", list(BASELINE_REGISTRY.keys())):
             logger.info("  → %s", bl_name)
-            print(f"[DEBUG] Training baseline: {bl_name}")
             try:
                 bl_model, bl_metrics, bl_hparams = tune_baseline_hparams(
                     bl_name,
@@ -1746,7 +1783,6 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 )
                 trained_baselines[bl_name] = bl_model
                 baseline_best_hparams[bl_name] = bl_hparams
-                print(f"[DEBUG] Finished baseline: {bl_name}, AUROC={bl_metrics.get('auroc') if isinstance(bl_metrics, dict) else 'N/A'}")
             except Exception as exc:
                 logger.error("Failed to train baseline %s: %s", bl_name, exc, exc_info=True)
 
@@ -1770,7 +1806,6 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # Full report
     # ------------------------------------------------------------------
     logger.info("Generating full report…")
-    print("[DEBUG] Running s_t probe...")
     report = generate_report(
         main_model=main_model,
         baselines=trained_baselines,
@@ -1779,8 +1814,6 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         device=device,
         output_path=cfg["results_path"],
     )
-    st_probe = report.get("st_probe_auroc", float("nan"))
-    print(f"[DEBUG] s_t probe AUROC: {st_probe}")
 
     # Augment with OOH training result, ablations and hparam search results
     if ooh_result:
@@ -1789,84 +1822,10 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     report["baseline_best_hparams"] = baseline_best_hparams
     report["hospital_valid"] = hospital_valid
 
-    # ------------------------------------------------------------------
-    # Canonical key aliases expected by downstream consumers
-    # ------------------------------------------------------------------
-    report["baseline_results"] = report.get("baselines", {})
-    report["main_model"] = report.get("main_model_indist", {})
-
-    # ------------------------------------------------------------------
-    # Force ΔAUROC computation (Step 4)
-    # ------------------------------------------------------------------
-    if "auroc_comparison" not in report:
-        _bl_aurocs = {
-            n: m.get("auroc", float("nan"))
-            for n, m in report.get("baselines", {}).items()
-            if "_ooh" not in n and isinstance(m, dict) and "auroc" in m
-        }
-        _main_auroc = report.get("main_model_indist", {}).get("auroc", float("nan"))
-        if _bl_aurocs and not math.isnan(_main_auroc):
-            _best_name = max(_bl_aurocs, key=lambda k: _bl_aurocs[k])
-            _best_auroc = _bl_aurocs[_best_name]
-            _delta = _main_auroc - _best_auroc
-            if _delta >= 0:
-                _status = "PASS"
-            elif _delta >= -0.01:
-                _status = "COMPETITIVE"
-            else:
-                _status = "NOT_COMPETITIVE"
-            report["auroc_comparison"] = {
-                "main_model_auroc": _main_auroc,
-                "best_baseline_name": _best_name,
-                "best_baseline_auroc": _best_auroc,
-                "delta_auroc": _delta,
-                "competitive_status": _status,
-            }
-
-    auroc_cmp = report.get("auroc_comparison", {})
-    print(f"[DEBUG] ΔAUROC: {auroc_cmp.get('delta_auroc', 'N/A')}")
-
-    # Promote competitive_status to top level
-    report["competitive_status"] = auroc_cmp.get("competitive_status", "N/A")
-
-    # ------------------------------------------------------------------
-    # Domain generalization (Step 5)
-    # ------------------------------------------------------------------
-    if "domain_generalization" not in report and ooh_result:
-        _in_auroc = indist["metrics"].get("auroc", float("nan"))
-        _ooh = ooh_result.get("out_of_hospital", ooh_result.get("metrics", {}))
-        _ood_auroc = _ooh.get("auroc", float("nan"))
-        domain_metrics = {
-            "in_dist_auroc": round(_in_auroc, 4),
-            "ood_auroc": round(_ood_auroc, 4),
-        }
-        assert "in_dist_auroc" in domain_metrics
-        assert "ood_auroc" in domain_metrics
-        print(f"[DEBUG] Domain metrics: {domain_metrics}")
-        report["domain_generalization"] = domain_metrics
-
-    # ------------------------------------------------------------------
-    # Assertions before saving (Step 1)
-    # ------------------------------------------------------------------
-    assert report is not None, "results dict is None"
-    assert isinstance(report, dict), "results must be dict"
-    for _k in ["baseline_results", "main_model"]:
-        if _k not in report:
-            raise RuntimeError(f"Missing key in results: {_k}")
-
     save_json(report, cfg["results_path"])
-    print(f"[DEBUG] Saved results to {cfg['results_path']}")
     logger.info("=" * 60)
     logger.info("DONE. Results saved to %s", cfg["results_path"])
     logger.info("=" * 60)
-
-    # ------------------------------------------------------------------
-    # Fail-hard checks (Step 8)
-    # ------------------------------------------------------------------
-    if "auroc_comparison" not in report:
-        raise RuntimeError("AUROC comparison missing from results")
-    if "st_probe_auroc" not in report:
-        raise RuntimeError("s_t probe missing from results")
 
     # ------------------------------------------------------------------
     # Generate plots and tables
@@ -1875,22 +1834,18 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         generate_plots(report, main_model, trained_baselines, ablation_results,
                        test_loader, device, cfg["output_dir"])
         logger.info("Plots saved to %s/plots/", cfg["output_dir"])
-        print(f"[DEBUG] Saved plots to {cfg['output_dir']}/plots/")
     except Exception as exc:
         logger.warning("Plot generation failed: %s", exc)
 
     try:
         generate_tables(report, ablation_results, cfg["output_dir"])
         logger.info("Tables saved to %s/tables/", cfg["output_dir"])
-        print(f"[DEBUG] Saved tables to {cfg['output_dir']}/tables/")
     except Exception as exc:
         logger.warning("Table generation failed: %s", exc)
 
     try:
         generate_metrics_csv(report, ablation_results, cfg["output_dir"])
-        metrics_path = os.path.join(cfg["output_dir"], "metrics.csv")
         logger.info("metrics.csv saved to %s/", cfg["output_dir"])
-        print(f"[DEBUG] Saved metrics to {metrics_path}")
     except Exception as exc:
         logger.warning("metrics.csv generation failed: %s", exc)
 
@@ -1899,25 +1854,6 @@ def main(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     _print_final_summary(report, indist, ooh_result, ablation_results,
                          baseline_best_hparams)
-
-    # ------------------------------------------------------------------
-    # FINAL RESULTS summary (Step 7)
-    # ------------------------------------------------------------------
-    _best_name_cmp = auroc_cmp.get("best_baseline_name", "N/A")
-    _best_auroc_cmp = auroc_cmp.get("best_baseline_auroc", float("nan"))
-    _main_auroc_cmp = auroc_cmp.get("main_model_auroc", float("nan"))
-    _delta_cmp = auroc_cmp.get("delta_auroc", float("nan"))
-    _ood_auroc_cmp = report.get("domain_generalization", {}).get("ood_auroc", float("nan"))
-    _st_probe_cmp = report.get("st_probe_auroc", float("nan"))
-    print("\n===== FINAL RESULTS =====")
-    print(f"Best baseline: {_best_name_cmp} {_best_auroc_cmp}")
-    print(f"Main model: {_main_auroc_cmp}")
-    print(f"ΔAUROC: {_delta_cmp}")
-    print(f"OOD AUROC: {_ood_auroc_cmp}")
-    print(f"s_t probe: {_st_probe_cmp}")
-    print("========================")
-
-    return report
 
 
 def _print_final_summary(
@@ -2465,7 +2401,7 @@ def run_full_experiment(cfg: Dict[str, Any]) -> None:
 
     # Load seed-42 result to get seed-42 AUROC
     import json
-    results_path = cfg.get("results_path", os.path.join(_BASE_DIR, "outputs", "results.json"))
+    results_path = cfg.get("results_path", "outputs/results.json")
     try:
         with open(results_path) as f:
             seed42_report = json.load(f)
@@ -2528,7 +2464,6 @@ def run_full_experiment(cfg: Dict[str, Any]) -> None:
         "high_variance_warning": bool(std_auroc > 0.02),
     }
     save_json(seed_summary, f"{cfg['output_dir']}/multi_seed_summary.json")
-    print(f"[DEBUG] Saved multi-seed summary to {cfg['output_dir']}/multi_seed_summary.json")
 
     # Append to main results.json
     try:
@@ -2540,16 +2475,8 @@ def run_full_experiment(cfg: Dict[str, Any]) -> None:
         logger.warning("Could not update results.json with multi-seed summary: %s", exc)
 
     # ------------------------------------------------------------------
-    # Final summary print + directory dump (Step 5)
+    # Final summary print
     # ------------------------------------------------------------------
-    print("\n[DEBUG] Final output directory contents:")
-    for root, dirs, files in os.walk(cfg["output_dir"]):
-        for name in files:
-            print(os.path.join(root, name))
-
-    if not os.listdir(cfg["output_dir"]):
-        raise RuntimeError("No output files were generated. Pipeline failed silently.")
-
     print("\n" + "=" * 60)
     print("FULL EXPERIMENT COMPLETE")
     print("=" * 60)
@@ -2611,7 +2538,6 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    print(f"[DEBUG] Running mode: {args.mode}")
     cfg = DEFAULT_CFG.copy()
 
     if args.config:
@@ -2629,10 +2555,10 @@ if __name__ == "__main__":
     if args.seed is not None:
         cfg["seed"] = args.seed
     if args.output_dir is not None:
-        cfg["output_dir"] = os.path.abspath(args.output_dir)
-        cfg["checkpoint_dir"] = os.path.join(cfg["output_dir"], "checkpoints")
-        cfg["log_file"] = os.path.join(cfg["output_dir"], "train.log")
-        cfg["results_path"] = os.path.join(cfg["output_dir"], "results.json")
+        cfg["output_dir"] = args.output_dir
+        cfg["checkpoint_dir"] = f"{args.output_dir}/checkpoints"
+        cfg["log_file"] = f"{args.output_dir}/train.log"
+        cfg["results_path"] = f"{args.output_dir}/results.json"
     if args.split_mode is not None:
         cfg["split_mode"] = args.split_mode
     if args.no_ablations:
@@ -2641,14 +2567,6 @@ if __name__ == "__main__":
         cfg["run_baselines"] = False
     if args.hparam_search:
         cfg["baseline_hparam_search"] = True
-
-    # Force output directories to exist before any I/O
-    OUTPUT_DIR = cfg["output_dir"]
-    PLOTS_DIR = os.path.join(OUTPUT_DIR, "plots")
-    TABLES_DIR = os.path.join(OUTPUT_DIR, "tables")
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-    os.makedirs(TABLES_DIR, exist_ok=True)
-    os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
 
     if args.mode == "full_experiment":
         run_full_experiment(cfg)

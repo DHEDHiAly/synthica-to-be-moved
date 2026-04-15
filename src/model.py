@@ -74,6 +74,11 @@ class GradientReversal(nn.Module):
 # Encoder
 # ---------------------------------------------------------------------------
 
+class GRUEncoder(nn.Module):
+    """
+    Sequential encoder: (x_t, u_t) → hidden_t → (s_t, e_t).
+    s_t: invariant disease state  [B, s_dim]
+    e_t: environment/treatment state [B, e_dim]
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -130,6 +135,17 @@ class GRUEncoder(nn.Module):
         self.input_proj = nn.Linear(input_dim + treatment_dim, hidden_dim)
         self.gru = nn.GRU(
             input_size=hidden_dim,
+        x_dim: int,
+        u_dim: int,
+        hidden_dim: int,
+        s_dim: int,
+        e_dim: int,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=x_dim + u_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
@@ -315,6 +331,21 @@ class TreatmentAdversary(nn.Module):
         return self.classifier(self.grl(s))
 
 
+class ContrastiveHead(nn.Module):
+    """Projection head for NT-Xent contrastive loss."""
+
+    def __init__(self, s_dim: int, proj_dim: int = 64):
+    """Predict binary outcome from the final invariant state s_T."""
+
+    def __init__(self, s_dim: int, hidden_dim: int = 64) -> None:
+        super().__init__()
+        self.net = _mlp(s_dim, hidden_dim, 1, n_layers=2)
+
+    def forward(self, s_final: torch.Tensor) -> torch.Tensor:
+        """s_final: (B, s_dim) → logits: (B,)"""
+        return self.net(s_final).squeeze(-1)
+
+
 class HospitalAdversary(nn.Module):
     """Adversarially classify hospital from s_t (via gradient reversal)."""
 
@@ -465,6 +496,49 @@ class DisentangledICUModel(nn.Module):
         if use_contrastive:
             self.contrastive_head = ContrastiveHead(s_dim, s_dim // 2)
 
+        x_dim: int,
+        u_dim: int,
+        num_hospitals: int,
+        s_dim: int = 64,
+        e_dim: int = 32,
+        hidden_dim: int = 128,
+        enc_layers: int = 2,
+        enc_dropout: float = 0.1,
+        num_trt_classes: int = 2,
+        proj_dim: int = 64,
+        grl_alpha: float = 1.0,
+        use_e_for_outcome: bool = False,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        use_e_for_outcome : bool
+            When True, the outcome head is applied to e_final instead of s_final.
+            This is used for the "no_invariant_s" ablation study, which tests whether
+            the invariant s_t branch actually carries predictive signal.  If removing
+            s_t causes a large performance drop, it confirms s_t is non-trivial.
+        """
+        super().__init__()
+        self.s_dim = s_dim
+        self.e_dim = e_dim
+        self.use_e_for_outcome = use_e_for_outcome
+
+        self.encoder = GRUEncoder(x_dim, u_dim, hidden_dim, s_dim, e_dim,
+                                  enc_layers, enc_dropout)
+        self.inv_dynamics = InvariantDynamics(s_dim, hidden_dim // 2)
+        self.env_dynamics = EnvironmentDynamics(e_dim, u_dim, hidden_dim // 2)
+        # Note: dynamics modules use hidden_dim // 2 to keep parameter count balanced
+        # relative to the larger encoder while avoiding overfitting in the dynamics.
+        self.decoder = Decoder(s_dim, e_dim, x_dim, hidden_dim)
+        # Outcome head dimension depends on ablation mode.
+        outcome_in_dim = e_dim if use_e_for_outcome else s_dim
+        self.outcome_head = OutcomeHead(outcome_in_dim, hidden_dim // 2)
+        self.hosp_adversary = HospitalAdversary(s_dim, num_hospitals,
+                                                hidden_dim // 2, grl_alpha)
+        self.trt_adversary = TreatmentAdversary(s_dim, num_trt_classes,
+                                                hidden_dim // 2, grl_alpha)
+        self.contrastive_head = ContrastiveHead(s_dim, proj_dim)
+
     # ------------------------------------------------------------------
     def forward(
         self,
@@ -572,13 +646,6 @@ class DisentangledICUModel(nn.Module):
             "s_t_std_mean": float(s_flat.std(dim=0).mean().item()),
         }
 
-    def set_grl_alpha(self, alpha: float) -> None:
-        """Anneal the gradient reversal strength."""
-        if hasattr(self, "hospital_adv"):
-            self.hospital_adv.set_alpha(alpha)
-        if hasattr(self, "treatment_adv"):
-            self.treatment_adv.set_alpha(alpha)
-
 
 # ---------------------------------------------------------------------------
 # Ablation variant: no s_t — uses only e_t
@@ -645,6 +712,104 @@ class EtOnlyModel(nn.Module):
             "s_seq": torch.zeros(B, T, 1, device=x.device),  # dummy
             "e_seq": e_seq,
         }
+        mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        B, T, _ = x.shape
+
+        # 1. Encode
+        s, e, _ = self.encoder(x, u)           # (B, T, s_dim/e_dim)
+
+        # 2. Latent dynamics — predict NEXT step
+        s_next = self.inv_dynamics(s)           # (B, T, s_dim)
+        e_next = self.env_dynamics(e, u)        # (B, T, e_dim)
+
+        # 3. Decode next-step
+        x_pred = self.decoder(s_next, e_next)  # (B, T, x_dim)
+
+        # 4. Outcome from final valid state (invariant branch or env branch)
+        if mask is not None:
+            seq_lens = mask.long().sum(dim=1).clamp(min=1) - 1  # (B,)
+            s_final = s[torch.arange(B, device=s.device), seq_lens]
+            e_final = e[torch.arange(B, device=e.device), seq_lens]
+        else:
+            s_final = s[:, -1]                  # (B, s_dim)
+            e_final = e[:, -1]                  # (B, e_dim)
+
+        # use_e_for_outcome=True → ablation: outcome predicted from e_t only
+        outcome_input = e_final if self.use_e_for_outcome else s_final
+        outcome_logit = self.outcome_head(outcome_input)
+
+        # 5. Adversarial heads — flatten time, optionally apply mask
+        if mask is not None:
+            valid_mask = mask.view(-1)                   # (B*T,)
+            s_flat = s.view(B * T, self.s_dim)[valid_mask]
+        else:
+            s_flat = s.view(B * T, self.s_dim)
+        hosp_logits = self.hosp_adversary(s_flat)
+        trt_logits = self.trt_adversary(s_flat)
+
+        # 6. Contrastive projection
+        s_proj = self.contrastive_head(s)        # (B, T, proj_dim)
+
+        return {
+            "x_pred": x_pred,
+            "outcome_logit": outcome_logit,
+            "hosp_logits": hosp_logits,
+            "trt_logits": trt_logits,
+            "s": s,
+            "e": e,
+            "s_next": s_next,
+            "e_next": e_next,
+            "s_proj": s_proj,
+            "s_final": s_final,
+            "e_final": e_final,
+        }
+
+    # ------------------------------------------------------------------
+    def simulate_counterfactual(
+        self,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        u_cf: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Simulate counterfactual trajectory under alternative treatment u_cf.
+
+        The invariant state s is held fixed (shared between factual and
+        counterfactual); only the environment branch changes with u_cf.
+        """
+        B, T, _ = x.shape
+        with torch.no_grad():
+            # Factual pass
+            s, e_fact, _ = self.encoder(x, u)
+
+            # Counterfactual: re-run env dynamics with u_cf
+            e_cf = self.env_dynamics(e_fact, u_cf)
+            s_next = self.inv_dynamics(s)
+
+            x_cf_pred = self.decoder(s_next, e_cf)
+
+            # Outcome under counterfactual
+            if mask is not None:
+                seq_lens = mask.long().sum(dim=1).clamp(min=1) - 1
+                s_final = s[torch.arange(B, device=s.device), seq_lens]
+            else:
+                s_final = s[:, -1]
+            outcome_cf = torch.sigmoid(self.outcome_head(s_final))
+
+        return {
+            "x_cf_pred": x_cf_pred,
+            "outcome_cf": outcome_cf,
+            "s": s,
+            "e_cf": e_cf,
+        }
+
+    # ------------------------------------------------------------------
+    def set_grl_alpha(self, alpha: float) -> None:
+        """Anneal the gradient reversal strength."""
+        self.hosp_adversary.set_alpha(alpha)
+        self.trt_adversary.set_alpha(alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -653,14 +818,17 @@ class EtOnlyModel(nn.Module):
 
 def build_model(cfg: Dict, device: torch.device) -> DisentangledICUModel:
     model = DisentangledICUModel(
-        input_dim=cfg["num_features"],
-        treatment_dim=cfg["num_treatments"],
-        n_hospitals=cfg["num_hospitals"],
+        x_dim=cfg["num_features"],
+        u_dim=cfg["num_treatments"],
+        num_hospitals=cfg["num_hospitals"],
         s_dim=cfg.get("s_dim", 64),
         e_dim=cfg.get("e_dim", 32),
         hidden_dim=cfg.get("hidden_dim", 128),
-        num_layers=cfg.get("enc_layers", 2),
-        dropout=cfg.get("enc_dropout", 0.1),
+        enc_layers=cfg.get("enc_layers", 2),
+        enc_dropout=cfg.get("enc_dropout", 0.1),
+        num_trt_classes=cfg.get("num_trt_classes", 2),
+        proj_dim=cfg.get("proj_dim", 64),
         grl_alpha=cfg.get("grl_alpha", 1.0),
+        use_e_for_outcome=cfg.get("use_e_for_outcome", False),
     )
     return model.to(device)
